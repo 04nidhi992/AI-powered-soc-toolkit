@@ -70,7 +70,7 @@ def generate_incident_report(findings: Iterable[LogFinding], alerts: Iterable[Se
     if finding_list:
         lines.extend(f"- **{_markdown_text(f.severity)}** "
                      f"`{_markdown_text(_report_text(f.path, redact_usernames, redact_ips))}:{f.line_number}` "
-                     f"? {_markdown_text(_report_text(f.text, redact_usernames, redact_ips))} "
+                     f" | {_markdown_text(_report_text(f.text, redact_usernames, redact_ips))} "
                      f"(rule `{_markdown_text(f.rule_id or '')}`; "
                      f"{_markdown_text(_report_text(f.reason, redact_usernames, redact_ips))})"
                      for f in finding_list)

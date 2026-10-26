@@ -217,7 +217,7 @@ def _xml_event(element: ET.Element, source: str, number: int) -> NormalizedEvent
             fields[f"data_{data_name}"] = node.text
             if data_name.casefold() in {"ipaddress", "sourceip", "sourceaddress"}:
                 fields["source_ip"] = node.text
-            elif data_name.casefold() in {"targetusername", "username", "user"}:
+            elif data_name.casefold() in {"targetusername", "subjectusername", "username", "user", "accountname"}:
                 fields["username"] = node.text
             elif data_name.casefold() in {"workstationname", "computername"}:
                 fields["host"] = node.text
@@ -225,8 +225,33 @@ def _xml_event(element: ET.Element, source: str, number: int) -> NormalizedEvent
     return _event_from_mapping(fields, source, f"event-{number}", message)
 
 
+def _ingest_evtx(source: Path) -> IngestionResult:
+    """Parse native EVTX records with python-evtx and normalize each record's XML."""
+    try:
+        from Evtx.Evtx import Evtx
+    except ImportError:
+        return IngestionResult((), (ParseIssue("dependency", "Native EVTX parsing requires python-evtx; install it with `python -m pip install -r requirements.txt`"),))
+    events: list[NormalizedEvent] = []
+    issues: list[ParseIssue] = []
+    try:
+        with Evtx(str(source)) as log:
+            for number, record in enumerate(log.records(), 1):
+                try:
+                    root = ET.fromstring(record.xml())
+                    event = next((node for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "Event"), root)
+                    events.append(_xml_event(event, str(source), number))
+                except (ET.ParseError, ValueError, TypeError, AttributeError) as exc:
+                    issues.append(ParseIssue(f"record-{number}", f"Malformed EVTX record: {exc}"))
+    except (OSError, ValueError, EOFError) as exc:
+        issues.append(ParseIssue("evtx", f"Could not parse EVTX file: {exc}"))
+    except Exception as exc:
+        # Parser-specific structural errors vary by python-evtx release.
+        issues.append(ParseIssue("evtx", f"Could not parse EVTX file: {type(exc).__name__}: {exc}"))
+    return IngestionResult(tuple(events), tuple(issues))
+
+
 def ingest_log_file(path: str | Path, log_format: str = "auto", max_bytes: int = 10_000_000) -> IngestionResult:
-    """Stream supported syslog, JSONL, CSV, and Windows Event XML into normalized events."""
+    """Ingest supported text exports and native Windows EVTX into normalized events."""
     source = Path(path)
     issues: list[ParseIssue] = []
     events: list[NormalizedEvent] = []
@@ -234,9 +259,11 @@ def ingest_log_file(path: str | Path, log_format: str = "auto", max_bytes: int =
         return IngestionResult((), (ParseIssue("file", f"File exceeds {max_bytes:,} byte limit"),))
     kind = log_format.casefold()
     if kind == "auto":
-        kind = {".csv": "csv", ".json": "json", ".jsonl": "jsonl", ".ndjson": "jsonl", ".xml": "xml"}.get(source.suffix.casefold(), "syslog")
-    if kind not in {"syslog", "json", "jsonl", "csv", "xml"}:
+        kind = {".csv": "csv", ".json": "json", ".jsonl": "jsonl", ".ndjson": "jsonl", ".xml": "xml", ".evtx": "evtx"}.get(source.suffix.casefold(), "syslog")
+    if kind not in {"syslog", "json", "jsonl", "csv", "xml", "evtx"}:
         return IngestionResult((), (ParseIssue("format", f"Unsupported log format: {log_format}"),))
+    if kind == "evtx":
+        return _ingest_evtx(source)
     if kind == "xml":
         try:
             for number, (_, element) in enumerate(ET.iterparse(source, events=("end",)), 1):

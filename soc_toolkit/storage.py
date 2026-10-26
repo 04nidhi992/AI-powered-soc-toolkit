@@ -142,6 +142,11 @@ class Storage:
                                 row["destination_ip"], row["evidence_ref"], row["event_id"],
                                 json.loads(row["raw_fields_json"])) for row in rows]
 
+    def count_events(self) -> int:
+        """Return the exact number of locally stored normalized events."""
+        with self._lock:
+            return int(self.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+
     def save_detection(self, detection: DetectionResult) -> bool:
         dedupe = hashlib.sha256("\0".join((detection.rule_id, ",".join(detection.event_refs))).encode()).hexdigest()
         with self.transaction() as db:
@@ -197,6 +202,20 @@ class Storage:
             rows = self.connection.execute(f"SELECT * FROM alerts{where} ORDER BY created_at DESC LIMIT ?",
                                            (*params, max(0, limit))).fetchall()
         return [self._alert(row) for row in rows]
+
+    def count_alerts(self, severity: str | None = None, status: str | None = None) -> int:
+        """Count all stored alerts, optionally filtered by severity and status."""
+        clauses, params = [], []
+        if severity:
+            clauses.append("severity = ?")
+            params.append(severity.upper())
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            row = self.connection.execute(f"SELECT COUNT(*) FROM alerts{where}", params).fetchone()
+        return int(row[0])
 
     def get_alert(self, alert_id: str) -> SecurityAlert | None:
         with self._lock:

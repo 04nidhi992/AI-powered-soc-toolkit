@@ -2,3 +2,4 @@ psutil>=5.9
 streamlit>=1.40
 plotly>=5.24
 pytest>=8.0
+python-evtx>=0.8.1

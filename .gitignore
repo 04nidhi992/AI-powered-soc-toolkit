@@ -8,6 +8,8 @@ venv/
 soc_data/
 soc_alerts.log
 *.log
+!sample_data/linux_auth.log
+!sample_data/synthetic_auth_demo.log
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm

@@ -1,0 +1,8 @@
+Mar 01 09:58:00 synth-soc-lab chronyd[120]: [SYNTHETIC] routine clock synchronization completed
+Mar 01 09:59:00 synth-soc-lab sshd[2000]: [SYNTHETIC] routine authentication service check passed
+Mar 01 10:00:00 synth-soc-lab sshd[2101]: [SYNTHETIC] Failed password for demo_alice from 198.51.100.44 port 54101 ssh2
+Mar 01 10:01:00 synth-soc-lab sshd[2102]: [SYNTHETIC] Failed password for demo_bob from 198.51.100.44 port 54102 ssh2
+Mar 01 10:02:00 synth-soc-lab sshd[2103]: [SYNTHETIC] Failed password for demo_carol from 198.51.100.44 port 54103 ssh2
+Mar 01 10:03:00 synth-soc-lab sshd[2104]: [SYNTHETIC] Failed password for demo_dave from 198.51.100.44 port 54104 ssh2
+Mar 01 10:04:00 synth-soc-lab sshd[2105]: [SYNTHETIC] Failed password for demo_eve from 198.51.100.44 port 54105 ssh2
+Mar 01 10:06:00 synth-soc-lab sshd[2110]: [SYNTHETIC] Accepted password for demo_alice from 198.51.100.44 port 54110 ssh2

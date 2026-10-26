@@ -39,6 +39,8 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
+The requirements include `python-evtx` for native `.evtx` parsing. To update an existing virtual environment after upgrading the project, run `python -m pip install -r requirements.txt` (or `\.venv\Scripts\python.exe -m pip install -r requirements.txt` without activation). EVTX files are parsed locally; no external service is contacted. The repository does not bundle a real EVTX fixture, so native record parsing must be validated with an authorized sample on the target environment.
+
 If PowerShell does not allow activation, do not change its execution policy. Use the environment's interpreter directly:
 
 ```powershell
@@ -61,6 +63,8 @@ Without activating the environment:
 
 The package launcher is also available as `python -m soc_toolkit` or `python -m soc_toolkit.main`. The dashboard initializes local state under `soc_data/` on first run. This directory, SQLite databases, logs, `.env`, and virtual environments are excluded from Git.
 
+The Streamlit dashboard uses the dark navy theme in `.streamlit/config.toml`. Its overview cards use exact SQLite event and alert counts; the process card reports the current sample capped at 100 entries. The local-workspace badge indicates that dashboard storage initialized, not that the host is threat-free.
+
 ## Sample-data walkthrough
 
 1. Launch the dashboard and open **Log Analysis**.
@@ -70,6 +74,18 @@ The package launcher is also available as `python -m soc_toolkit` or `python -m 
 5. Review persisted alerts, correlate by available identity fields, create an incident, add typed investigation notes, then build/download a redacted report.
 
 The samples are fabricated and do not represent collected endpoint data. They are safe test fixtures, not attack instructions.
+
+### Mentor demo: `synthetic_auth_demo.log`
+
+This explicitly labelled RFC3164 syslog fixture contains eight records: two routine events, five failed logins from the documentation-only IP `198.51.100.44` across five synthetic usernames on one synthetic host, then one successful login. All timestamps are within the configured 900-second correlation window. The default repeated-login threshold is five.
+
+1. From the project root, start the app with `\.venv\Scripts\python.exe -m streamlit run soc_toolkit/dashboard.py` and open the local URL Streamlit prints.
+2. Select **Log Analysis**, upload `sample_data/synthetic_auth_demo.log`, leave **Format** as `auto`, then click **Parse and analyze**.
+3. Confirm **8 events parsed** and **0 parse errors**. Lines 1–2 are routine `syslog` events; lines 3–7 are failed logins; line 8 is a successful login. The normalized auth events include `host`, `username`, `source_ip`, timestamp, event type, and a file evidence reference such as `synthetic_auth_demo.log:3`.
+4. Expected new detections: one **HIGH `REPEATED_FAILED_LOGINS`** detection referencing the five failures, and five **HIGH `FAILED_THEN_SUCCESS`** detections (one per earlier failure paired with the later success). The repeated-login rule reason is `5 failed-login events shared validated source IP 198.51.100.44 within the configured time window, across the observed account/host values.` Persisted alert text redacts the IP as `[IP]`. Alert evidence references are normalized event IDs; the dashboard currently shows the file-line references on event rows and the IDs in detection/alert evidence, without a direct ID-to-line mapping.
+5. The two routine records should not appear in those detection evidence references. Open **Alerts** to inspect persisted alert reasons and references. **Correlation** should group records only when shared host, username, or source-IP evidence is present.
+
+On a first import into the local database, the upload should create six alerts from this fixture. Re-importing the same file is deduplicated and can report zero new alerts; it should not create duplicates. The test suite runs the fixture through the real parser, detector, and SQLite alert-persistence helper.
 
 ## Reproducible demonstration and manual dashboard checklist
 
@@ -117,7 +133,8 @@ Current case reports include linked events, alerts with rule identifiers and rea
 
 - `models.py`, `config.py`, `settings.py`: shared typed models and local defaults.
 - `monitoring.py`, `process_analysis.py`: system snapshot, uptime, process inventory, and explainable path indicators.
-- `log_analysis.py`: streaming syslog, JSONL, CSV, and Windows Event XML ingestion; malformed-record reporting and normalization.
+- `log_analysis.py`: streaming syslog, JSONL, CSV, Windows Event XML, and native EVTX ingestion; malformed-record reporting and normalization. Native EVTX parsing uses `python-evtx`.
+- `ioc_extraction.py`: validated IPv4/IPv6, domain, URL, MD5, SHA-1, and SHA-256 extraction from normalized events or text, with source evidence references. Indicators are labelled extracted, not malicious; private and reserved IP ranges are identified by scope.
 - `detection.py`, `correlation.py`: threshold, login-sequence, repeated-event, configured-rule, process, and evidence-led correlation logic.
 - `alerts.py`, `storage.py`: alert persistence, filters, status lifecycle, duplicate suppression, SQLite schema versioning and transactions.
 - `investigation.py`: incidents, typed notes, status, and timelines.
@@ -133,6 +150,12 @@ Edit `soc_toolkit/settings.py` and `soc_toolkit/config.py` to change warning/cri
 
 No AI request is made by default. Offline rule explanations always work. An optional OpenAI-compatible provider can be injected through `ai_analysis.py`; it requires an HTTPS endpoint, an API key supplied through an environment variable, an enabled setting, and explicit consent. Only a selected alert summary and selected evidence snippets are passed through basic IP, email, username, and secret-pattern redaction. Review the sanitized payload and provider terms before enabling it. Never configure credentials in source code. The app reads environment variables from its process; `.env.example` documents the variable names but is not automatically loaded.
 
+## Threat intelligence enrichment
+
+Threat intelligence is offline by default. Local extraction results are labelled `extracted`; they are not verdicts. To enable optional VirusTotal v3 lookups, set `SOC_VIRUSTOTAL_API_KEY` in the dashboard process environment, restart the app, open **Threat Intelligence**, select **VirusTotal (external lookup)**, select one indicator, and confirm the disclosure checkbox before clicking **Look up selected indicator**. Do not put the key in source code, dashboard inputs, or logs. The client uses the standard library, sends only the selected indicator identifier with an HTTPS GET request, and never uploads a file or event text. The default timeout is 5 seconds and local request spacing is 15 seconds; the values are configurable with `AppConfig.threat_intel_timeout_seconds` and `AppConfig.threat_intel_min_interval_seconds`.
+
+The dashboard skips private/reserved IPs, internal or example domains, and URLs with paths, credentials, queries, or fragments. Hash lookups send the hash itself; confirm that doing so is acceptable before querying a potentially proprietary file hash. VirusTotal documents that queried indicators may be added to its dataset and accessible to its community, and warns against querying sensitive, confidential, or personally identifying indicators. Its public API also has terms and usage limits, including restrictions on commercial products; review the [official API overview](https://docs.virustotal.com/docs/api-overview), [getting started](https://docs.virustotal.com/reference/getting-started), and [URL report reference](https://docs.virustotal.com/reference/url-info) before use. Results are shown in the current dashboard session and are not persisted. `no_match`, `offline`, skipped, or unavailable results do not mean an indicator is benign. The provider interface can be replaced with another implementation without changing IOC extraction.
+
 ## Tests
 
 Install dependencies from `requirements.txt`, then run:
@@ -147,7 +170,8 @@ The suite uses mocked system data and synthetic logs. It must not require admini
 
 ## Limitations and ethical use
 
-- Windows logs must be exported as XML or CSV; the toolkit does not read the native Windows Event Log service or binary EVTX files.
+- Native `.evtx` file ingestion is supported through `python-evtx`; the application does not read the live Windows Event Log service. No redistributable native EVTX fixture is included, and the parser's successful operation against a real EVTX file has not been verified by the repository test suite yet.
+- IOC extraction validates and labels candidate values but does not assess reputation or maliciousness. Common example domains are excluded, and private/reserved IPs are marked by scope rather than treated as malicious.
 - It is a learning and triage tool, not a replacement for an EDR/SIEM, and its rules can produce false positives or miss events.
 - Path indicators do not prove malware. No process is terminated, quarantined, or modified.
 - Reports do not establish chain of custody, forensic integrity, or legal admissibility.

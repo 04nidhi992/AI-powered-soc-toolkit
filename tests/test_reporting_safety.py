@@ -59,6 +59,10 @@ class ReportingSafetyTests(unittest.TestCase):
         self.assert_sensitive_values_redacted(markdown)
         self.assert_sensitive_values_redacted(json.dumps(payload))
         self.assertIn("AUTH", markdown)
+        finding_lines = [line for line in markdown.splitlines() if r"auth\.log" in line and "rule" in line]
+        self.assertEqual(1, len(finding_lines))
+        self.assertTrue(finding_lines[0].startswith("- **HIGH** `"))
+        self.assertIn(" | Failed password for", finding_lines[0])
 
     def test_case_report_redacts_raw_objects_and_escapes_untrusted_markdown(self):
         note = InvestigationNote(

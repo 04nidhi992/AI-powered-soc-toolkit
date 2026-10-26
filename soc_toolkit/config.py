@@ -16,6 +16,8 @@ class AppConfig:
     correlation_window_seconds: int = 900
     repeated_failed_login_threshold: int = 5
     repeated_event_threshold: int = 5
+    threat_intel_timeout_seconds: float = 5.0
+    threat_intel_min_interval_seconds: float = 15.0
     thresholds: Thresholds = Thresholds()
     process_indicators: ProcessIndicators = ProcessIndicators()
     report_redact_ips: bool = False
@@ -28,6 +30,8 @@ class AppConfig:
             raise ValueError("sampling_interval_seconds must be positive")
         if self.alert_deduplication_seconds < 0 or self.correlation_window_seconds < 0:
             raise ValueError("time windows cannot be negative")
+        if self.threat_intel_timeout_seconds <= 0 or self.threat_intel_min_interval_seconds < 0:
+            raise ValueError("threat intelligence timeout must be positive and rate interval non-negative")
         if self.repeated_failed_login_threshold < 2 or self.repeated_event_threshold < 2:
             raise ValueError("repeated-event thresholds must be at least 2")
 

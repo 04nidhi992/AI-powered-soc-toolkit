@@ -12,11 +12,22 @@ class CorrelationGroup:
     shared_fields: tuple[str, ...]
     start_time: str
     end_time: str
+    event_count: int = 0
+    event_types: tuple[str, ...] = ()
 
 
 def correlate_events(events: list[NormalizedEvent], window_seconds: int = 900,
-                     minimum_shared_fields: int = 1) -> list[CorrelationGroup]:
-    """Group events that share identity/network evidence and fit a time window."""
+                     minimum_shared_fields: int = 1,
+                     minimum_event_count: int = 2) -> list[CorrelationGroup]:
+    """Group events with shared identity evidence inside a time/count boundary.
+
+    Matching event types are retained as supporting evidence, but event type and
+    time proximity alone never create a group.
+    """
+    if isinstance(minimum_event_count, bool) or not isinstance(minimum_event_count, int) or minimum_event_count < 2:
+        raise ValueError("minimum_event_count must be an integer of at least 2")
+    if isinstance(minimum_shared_fields, bool) or not isinstance(minimum_shared_fields, int) or minimum_shared_fields < 1:
+        raise ValueError("minimum_shared_fields must be a positive integer")
     window = timedelta(seconds=max(0, window_seconds))
     ordered = sorted(events, key=lambda item: item.timestamp)
     parent = list(range(len(ordered)))
@@ -39,6 +50,9 @@ def correlate_events(events: list[NormalizedEvent], window_seconds: int = 900,
                       if value and value == getattr(ordered[right], name)}
             if len(shared) >= max(1, minimum_shared_fields):
                 parent[root(right)] = root(left)
+                if (ordered[left].event_type and ordered[right].event_type and
+                        ordered[left].event_type.casefold() == ordered[right].event_type.casefold()):
+                    shared.add("event_type")
                 pair_evidence[(left, right)] = shared
 
     components: dict[int, list[int]] = {}
@@ -46,7 +60,7 @@ def correlate_events(events: list[NormalizedEvent], window_seconds: int = 900,
         components.setdefault(root(index), []).append(index)
     groups: list[CorrelationGroup] = []
     for indexes in components.values():
-        if len(indexes) < 2:
+        if len(indexes) < minimum_event_count:
             continue
         refs = tuple(sorted(ordered[index].event_id for index in indexes))
         shared = set().union(*(fields for (left, right), fields in pair_evidence.items()
@@ -54,7 +68,14 @@ def correlate_events(events: list[NormalizedEvent], window_seconds: int = 900,
         if not shared:
             continue
         explanation_fields = tuple(sorted(shared))
+        event_types = tuple(sorted({ordered[index].event_type for index in indexes if ordered[index].event_type}))
+        explanation = (
+            f"Grouped {len(indexes)} events within the configured {int(window.total_seconds())}-second window "
+            f"because linked pairs shared fields ({', '.join(explanation_fields)}), including required identity evidence; "
+            f"observed event types: {', '.join(event_types) or 'unspecified'}. "
+            "Time proximity alone was insufficient."
+        )
         groups.append(CorrelationGroup(refs,
-            f"Grouped because at least one pair shared {', '.join(explanation_fields)} within the configured window; time proximity alone was insufficient.",
-            explanation_fields, ordered[indexes[0]].timestamp, ordered[indexes[-1]].timestamp))
+            explanation, explanation_fields, ordered[indexes[0]].timestamp,
+            ordered[indexes[-1]].timestamp, len(indexes), event_types))
     return groups

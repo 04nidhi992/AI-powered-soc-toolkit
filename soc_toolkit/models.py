@@ -4,8 +4,30 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
 import ipaddress
+import math
 import uuid
 from typing import Any
+
+
+def _normalize_iso_timestamp(value: str, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be an ISO 8601 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an ISO 8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
 
 
 def stable_event_id(timestamp: str, source: str, event_type: str, host: str | None,
@@ -43,6 +65,22 @@ class ProcessRecord:
     memory_percent: float
     status: str
     executable: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.pid, bool) or not isinstance(self.pid, int) or self.pid < 0:
+            raise ValueError("pid must be a non-negative integer")
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("Process name is required")
+        if self.username is not None and not isinstance(self.username, str):
+            raise ValueError("username must be text or None")
+        if not isinstance(self.status, str) or not self.status.strip():
+            raise ValueError("Process status is required")
+        if self.executable is not None and not isinstance(self.executable, str):
+            raise ValueError("executable must be text or None")
+        if not _is_finite_number(self.cpu_percent) or self.cpu_percent < 0:
+            raise ValueError("cpu_percent must be a finite non-negative number")
+        if not _is_finite_number(self.memory_percent) or not 0 <= self.memory_percent <= 100:
+            raise ValueError("memory_percent must be a finite number between 0 and 100")
 
 
 @dataclass(frozen=True)
@@ -142,6 +180,24 @@ class DetectionResult:
     evidence_summary: str
     recommended_steps: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        for name in ("detection_id", "rule_id", "rule_name", "reason", "evidence_summary"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} is required")
+        if not isinstance(self.severity, str) or self.severity.upper() not in {
+                "INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"}:
+            raise ValueError(f"Unsupported detection severity: {self.severity}")
+        object.__setattr__(self, "timestamp", _normalize_iso_timestamp(self.timestamp, "Detection timestamp"))
+        if not isinstance(self.event_refs, (tuple, list)) or any(
+                not isinstance(reference, str) or not reference.strip() for reference in self.event_refs):
+            raise ValueError("event_refs must contain non-empty text references")
+        if not isinstance(self.recommended_steps, (tuple, list)) or any(
+                not isinstance(step, str) or not step.strip() for step in self.recommended_steps):
+            raise ValueError("recommended_steps must contain non-empty text")
+        object.__setattr__(self, "event_refs", tuple(self.event_refs))
+        object.__setattr__(self, "recommended_steps", tuple(self.recommended_steps))
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -186,3 +242,12 @@ class ReportMetadata:
     title: str
     generated_at: str
     redacted: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.report_id, str) or not self.report_id.strip():
+            raise ValueError("report_id is required")
+        if not isinstance(self.title, str) or not self.title.strip():
+            raise ValueError("Report title is required")
+        object.__setattr__(self, "generated_at", _normalize_iso_timestamp(self.generated_at, "Report timestamp"))
+        if not isinstance(self.redacted, bool):
+            raise ValueError("redacted must be a boolean")

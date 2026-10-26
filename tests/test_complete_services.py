@@ -7,12 +7,12 @@ from unittest.mock import Mock
 
 from soc_toolkit.ai_analysis import explain_alert
 from soc_toolkit import dashboard
-from soc_toolkit.config import AppConfig
+from soc_toolkit.config import AppConfig, DEFAULT_CONFIG
 from soc_toolkit.correlation import correlate_events
 from soc_toolkit.detection import detect_events
 from soc_toolkit.investigation import add_investigation_note, create_incident, incident_timeline
 from soc_toolkit.log_analysis import ingest_log_file
-from soc_toolkit.models import NormalizedEvent, SecurityAlert
+from soc_toolkit.models import DetectionResult, NormalizedEvent, ProcessRecord, ReportMetadata, SecurityAlert
 from soc_toolkit.reports import build_case_report
 from soc_toolkit.settings import Thresholds
 from soc_toolkit.storage import Storage
@@ -34,6 +34,109 @@ class CompleteServiceTests(unittest.TestCase):
         rule_ids = {result.rule_id for result in detect_events(all_events, repeated_threshold=5)}
         self.assertIn("FAILED_THEN_SUCCESS", rule_ids)
         self.assertIn("REPEATED_FAILED_LOGINS", rule_ids)
+
+    def test_synthetic_auth_demo_triggers_expected_persisted_alerts_only_for_auth_events(self):
+        parsed = ingest_log_file(PROJECT / "sample_data" / "synthetic_auth_demo.log")
+        self.assertEqual(8, len(parsed.events))
+        self.assertEqual((), parsed.errors)
+        normal_events = [event for event in parsed.events if event.event_type == "syslog"]
+        failed_events = [event for event in parsed.events if event.event_type == "failed_login"]
+        successful_events = [event for event in parsed.events if event.event_type == "successful_login"]
+        self.assertEqual(2, len(normal_events))
+        self.assertEqual(5, len(failed_events))
+        self.assertEqual(1, len(successful_events))
+        self.assertEqual({"198.51.100.44"}, {event.source_ip for event in failed_events + successful_events})
+        self.assertEqual({"synth-soc-lab"}, {event.host for event in parsed.events})
+        self.assertEqual({"demo_alice", "demo_bob", "demo_carol", "demo_dave", "demo_eve"},
+                         {event.username for event in failed_events})
+        self.assertEqual({"demo_alice"}, {event.username for event in successful_events})
+
+        detections = detect_events(
+            list(parsed.events),
+            repeated_threshold=DEFAULT_CONFIG.repeated_failed_login_threshold,
+            correlation_window_seconds=DEFAULT_CONFIG.correlation_window_seconds,
+        )
+        repeated = [item for item in detections if item.rule_id == "REPEATED_FAILED_LOGINS"]
+        self.assertEqual(1, len(repeated))
+        self.assertEqual("HIGH", repeated[0].severity)
+        self.assertIn("5 failed-login events shared validated source IP 198.51.100.44", repeated[0].reason)
+        self.assertEqual(5, len(repeated[0].event_refs))
+        self.assertTrue({event.event_id for event in normal_events}.isdisjoint(repeated[0].event_refs))
+        self.assertNotIn("REPEATED_FAILED_LOGINS", {
+            item.rule_id for item in detect_events(normal_events, repeated_threshold=5)
+        })
+        self.assertEqual(5, sum(item.rule_id == "FAILED_THEN_SUCCESS" for item in detections))
+
+        with Storage(":memory:") as store:
+            self.assertEqual(8, store.save_events(list(parsed.events)))
+            self.assertEqual(6, dashboard._persist_detections(store, detections))
+            alerts = store.list_alerts(limit=20)
+            repeated_alerts = [item for item in alerts if item.rule_id == "REPEATED_FAILED_LOGINS"]
+            sequence_alerts = [item for item in alerts if item.rule_id == "FAILED_THEN_SUCCESS"]
+            self.assertEqual(1, len(repeated_alerts))
+            self.assertEqual(5, len(sequence_alerts))
+            self.assertEqual("HIGH", repeated_alerts[0].severity)
+            self.assertEqual({event.event_id for event in failed_events}, set(repeated_alerts[0].evidence_refs))
+            success_id = successful_events[0].event_id
+            self.assertTrue(all(success_id in alert.evidence_refs for alert in sequence_alerts))
+            self.assertTrue(all(len(alert.evidence_refs) == 2 for alert in sequence_alerts))
+
+    def test_repeated_failures_group_valid_shared_ip_across_accounts_and_hosts(self):
+        events = [
+            NormalizedEvent("2026-05-01T00:00:00+00:00", "synthetic", "failed_login", "HIGH", "failed",
+                            host="host-a", username="alice", source_ip="192.0.2.10"),
+            NormalizedEvent("2026-05-01T00:00:10+00:00", "synthetic", "failed_login", "HIGH", "failed",
+                            host="host-b", username="bob", source_ip="192.0.2.10"),
+            NormalizedEvent("2026-05-01T00:00:20+00:00", "synthetic", "failed_login", "HIGH", "failed",
+                            host="host-c", username="carol", source_ip="192.0.2.10"),
+        ]
+        detections = detect_events(events, repeated_threshold=3)
+        repeated = [item for item in detections if item.rule_id == "REPEATED_FAILED_LOGINS"]
+        self.assertEqual(1, len(repeated))
+        self.assertIn("validated source IP 192.0.2.10", repeated[0].reason)
+        self.assertEqual(3, len(repeated[0].event_refs))
+
+    def test_repeated_failures_without_ip_require_matching_host_and_username(self):
+        same_identity = [
+            NormalizedEvent("2026-05-01T00:00:00+00:00", "synthetic", "failed_login", "HIGH", "failed",
+                            host="host-a", username="alice"),
+            NormalizedEvent("2026-05-01T00:00:10+00:00", "synthetic", "failed_login", "HIGH", "failed",
+                            host="host-a", username="alice"),
+        ]
+        different_users = [
+            same_identity[0],
+            NormalizedEvent("2026-05-01T00:00:10+00:00", "synthetic", "failed_login", "HIGH", "failed",
+                            host="host-a", username="bob"),
+        ]
+        self.assertIn("REPEATED_FAILED_LOGINS", {item.rule_id for item in detect_events(same_identity, repeated_threshold=2)})
+        self.assertNotIn("REPEATED_FAILED_LOGINS", {item.rule_id for item in detect_events(different_users, repeated_threshold=2)})
+
+    def test_repeated_failures_reject_unrelated_ips_and_below_threshold(self):
+        events = [
+            NormalizedEvent("2026-05-01T00:00:00+00:00", "synthetic", "failed_login", "HIGH", "failed",
+                            host="host-a", username="alice", source_ip="192.0.2.10"),
+            NormalizedEvent("2026-05-01T00:00:10+00:00", "synthetic", "failed_login", "HIGH", "failed",
+                            host="host-b", username="alice", source_ip="192.0.2.11"),
+        ]
+        self.assertNotIn("REPEATED_FAILED_LOGINS", {item.rule_id for item in detect_events(events, repeated_threshold=2)})
+        self.assertNotIn("REPEATED_FAILED_LOGINS", {item.rule_id for item in detect_events(events[:1], repeated_threshold=2)})
+        with self.assertRaises(ValueError):
+            detect_events(events, repeated_threshold=1)
+
+    def test_invalid_imported_ip_is_discarded_and_not_used_as_shared_identity(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "invalid-ip.json"
+            path.write_text(json.dumps([
+                {"timestamp": "2026-05-01T00:00:00Z", "event_type": "failed_login",
+                 "message": "failed", "host": "host-a", "username": "alice", "source_ip": "not-an-ip"},
+                {"timestamp": "2026-05-01T00:00:10Z", "event_type": "failed_login",
+                 "message": "failed", "host": "host-a", "username": "bob", "source_ip": "not-an-ip"},
+            ]), encoding="utf-8")
+            imported = ingest_log_file(path)
+        self.assertTrue(all(event.source_ip is None for event in imported.events))
+        self.assertNotIn("REPEATED_FAILED_LOGINS", {
+            item.rule_id for item in detect_events(list(imported.events), repeated_threshold=2)
+        })
 
     def test_synthetic_log_to_incident_report_end_to_end(self):
         parsed = ingest_log_file(PROJECT / "sample_data" / "linux_auth.log")
@@ -151,6 +254,36 @@ class CompleteServiceTests(unittest.TestCase):
         self.assertEqual(1, len(correlate_events([first, boundary], 60)))
         self.assertEqual([], correlate_events([first, outside], 60))
 
+    def test_correlation_reports_matching_event_types_as_supporting_evidence(self):
+        first = NormalizedEvent("2026-05-01T00:00:00+00:00", "a", "auth_failure", "HIGH", "one",
+                                host="host-a")
+        second = NormalizedEvent("2026-05-01T00:00:10+00:00", "b", "AUTH_FAILURE", "HIGH", "two",
+                                 host="host-a")
+        group = correlate_events([first, second], 60)[0]
+        self.assertEqual(2, group.event_count)
+        self.assertIn("event_type", group.shared_fields)
+        self.assertEqual(("AUTH_FAILURE", "auth_failure"), group.event_types)
+        self.assertIn("required identity evidence", group.explanation)
+
+    def test_correlation_count_threshold_and_unrelated_same_type_events(self):
+        at = "2026-05-01T00:00:00+00:00"
+        same_host = [
+            NormalizedEvent(at, "a", "auth", "INFO", "one", host="host-a"),
+            NormalizedEvent("2026-05-01T00:00:10+00:00", "b", "auth", "INFO", "two", host="host-a"),
+            NormalizedEvent("2026-05-01T00:00:20+00:00", "c", "process", "INFO", "three", host="host-a"),
+        ]
+        self.assertEqual([], correlate_events(same_host[:2], 60, minimum_event_count=3))
+        group = correlate_events(same_host, 60, minimum_event_count=3)[0]
+        self.assertEqual(3, group.event_count)
+        self.assertIn("auth", group.event_types)
+        unrelated = [
+            NormalizedEvent(at, "a", "auth", "INFO", "one"),
+            NormalizedEvent("2026-05-01T00:00:01+00:00", "b", "auth", "INFO", "two"),
+        ]
+        self.assertEqual([], correlate_events(unrelated, 60))
+        with self.assertRaises(ValueError):
+            correlate_events(same_host, 60, minimum_event_count=1)
+
     def test_sqlite_persists_and_filters_events_alerts_incidents_and_notes(self):
         with Storage(":memory:") as store:
             event = NormalizedEvent("2026-05-01T00:00:00+00:00", "sample", "auth", "HIGH",
@@ -158,6 +291,7 @@ class CompleteServiceTests(unittest.TestCase):
                                     host="host", username="alice", source_ip="192.0.2.2", evidence_ref="sample:1")
             self.assertTrue(store.save_event(event))
             self.assertFalse(store.save_event(event))
+            self.assertEqual(1, store.count_events())
             stored_event = store.list_events()[0]
             self.assertNotIn("alice", stored_event.message)
             self.assertNotIn("192.0.2.2", stored_event.message)
@@ -168,7 +302,10 @@ class CompleteServiceTests(unittest.TestCase):
                                          (event.evidence_ref,), ("Validate source",))
             self.assertTrue(store.save_alert(alert))
             self.assertFalse(store.save_alert(alert))
+            self.assertEqual(1, store.count_alerts())
+            self.assertEqual(1, store.count_alerts(severity="HIGH", status="open"))
             self.assertTrue(store.update_alert_status(alert.alert_id, "investigating"))
+            self.assertEqual(1, store.count_alerts(status="investigating"))
             stored = store.list_alerts(status="investigating")[0]
             self.assertEqual(alert.alert_id, stored.alert_id)
             incident = create_incident("Test incident", [stored], [event], "Observed event", "Review account")
@@ -214,6 +351,47 @@ class CompleteServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             NormalizedEvent("not-a-timestamp", "x", "x", "INFO", "x")
         self.assertEqual(10_000_000, AppConfig().max_log_bytes)
+
+    def test_detection_result_validation_accepts_valid_records_and_rejects_bad_fields(self):
+        valid = DetectionResult("d-1", "RULE", "Rule name", "2026-05-01T00:00:00Z", "HIGH",
+                                "Reason", ["sample:1"], "Evidence summary", ["Review evidence"])
+        self.assertEqual("2026-05-01T00:00:00+00:00", valid.timestamp)
+        self.assertEqual(("sample:1",), valid.event_refs)
+        invalid_records = (
+            {"detection_id": ""},
+            {"timestamp": "not-a-time"},
+            {"severity": "UNKNOWN"},
+            {"event_refs": [""]},
+            {"recommended_steps": [None]},
+        )
+        values = {"detection_id": "d-1", "rule_id": "RULE", "rule_name": "Rule name",
+                  "timestamp": "2026-05-01T00:00:00Z", "severity": "HIGH", "reason": "Reason",
+                  "event_refs": ("sample:1",), "evidence_summary": "Evidence summary",
+                  "recommended_steps": ("Review evidence",)}
+        for updates in invalid_records:
+            with self.subTest(updates=updates), self.assertRaises(ValueError):
+                DetectionResult(**(values | updates))
+
+    def test_process_record_and_report_metadata_validation(self):
+        process = ProcessRecord(0, "system", None, 125.0, 50.0, "running")
+        self.assertEqual(125.0, process.cpu_percent)
+        with self.assertRaises(ValueError):
+            ProcessRecord(-1, "bad", None, 0, 0, "running")
+        with self.assertRaises(ValueError):
+            ProcessRecord(1, "bad", None, float("nan"), 0, "running")
+        with self.assertRaises(ValueError):
+            ProcessRecord(1, "bad", None, 10 ** 1000, 0, "running")
+        with self.assertRaises(ValueError):
+            ProcessRecord(1, "bad", None, 0, 101, "running")
+        with self.assertRaises(ValueError):
+            ProcessRecord(1, "bad", None, 0, 0, "")
+
+        metadata = ReportMetadata("r-1", "Synthetic report", "2026-05-01T00:00:00Z")
+        self.assertEqual("2026-05-01T00:00:00+00:00", metadata.generated_at)
+        with self.assertRaises(ValueError):
+            ReportMetadata("r-2", "Synthetic report", "invalid timestamp")
+        with self.assertRaises(ValueError):
+            ReportMetadata("r-3", "Synthetic report", "2026-05-01T00:00:00Z", redacted=1)
 
     def test_critical_system_thresholds_generate_critical_detection(self):
         from soc_toolkit.detection import detect_system_metrics

@@ -1,7 +1,8 @@
 """Explainable defensive detections over normalized logs, metrics, and process reviews."""
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+import ipaddress
 import uuid
 
 from .alerts import evaluate_snapshot
@@ -26,6 +27,9 @@ def _detection(rule_id: str, name: str, severity: str, reason: str,
 
 def detect_events(events: list[NormalizedEvent], rules: tuple[DetectionRule, ...] = DEFAULT_RULES,
                   repeated_threshold: int = 5, correlation_window_seconds: int = 900) -> list[DetectionResult]:
+    if (isinstance(repeated_threshold, bool) or not isinstance(repeated_threshold, int)
+            or repeated_threshold < 2):
+        raise ValueError("repeated_threshold must be at least 2")
     results: list[DetectionResult] = []
     ordered = sorted(events, key=lambda event: event.timestamp)
     window = timedelta(seconds=max(0, correlation_window_seconds))
@@ -38,24 +42,47 @@ def detect_events(events: list[NormalizedEvent], rules: tuple[DetectionRule, ...
               "4625" in event.event_type or "failed" in event.message.casefold()]
     successful = [event for event in ordered if "success" in event.event_type.casefold() or
                   "4624" in event.event_type or "successful" in event.message.casefold()]
-    keys = lambda event: (event.source_ip or "", event.username or "", event.host or "")
-    counts = Counter(keys(event) for event in failed if any(keys(event)))
-    for identity, count in counts.items():
-        if count >= repeated_threshold:
-            group = sorted((event for event in failed if keys(event) == identity), key=lambda event: event.timestamp)
-            qualifying: list[NormalizedEvent] = []
-            for start in range(len(group)):
-                end = start
-                while end < len(group) and datetime.fromisoformat(group[end].timestamp) - datetime.fromisoformat(group[start].timestamp) <= window:
-                    end += 1
-                if end - start >= repeated_threshold:
-                    qualifying = group[start:end]
-                    break
-            if not qualifying:
-                continue
-            results.append(_detection("REPEATED_FAILED_LOGINS", "Repeated failed logins", "HIGH",
-                f"{len(qualifying)} failed-login events shared the available source, account, or host identity fields within the configured time window.",
-                qualifying, "; ".join(value or "unknown" for value in identity)))
+    failure_groups: dict[tuple[str, ...], list[NormalizedEvent]] = defaultdict(list)
+    for event in failed:
+        source_ip = None
+        if event.source_ip:
+            try:
+                source_ip = str(ipaddress.ip_address(event.source_ip))
+            except ValueError:
+                source_ip = None
+        if source_ip:
+            # A shared, validated source IP can reveal spraying across accounts or hosts.
+            identity = ("source_ip", source_ip)
+        elif event.host and event.username:
+            # Without a usable IP, require the more specific host+account pair.
+            identity = ("host_user", event.host.casefold(), event.username.casefold())
+        else:
+            continue
+        failure_groups[identity].append(event)
+
+    for identity, grouped_failures in failure_groups.items():
+        group = sorted(grouped_failures, key=lambda event: event.timestamp)
+        qualifying: list[NormalizedEvent] = []
+        for start in range(len(group)):
+            end = start
+            while (end < len(group) and
+                   datetime.fromisoformat(group[end].timestamp) - datetime.fromisoformat(group[start].timestamp) <= window):
+                end += 1
+            if end - start >= repeated_threshold:
+                qualifying = group[start:end]
+                break
+        if not qualifying:
+            continue
+        if identity[0] == "source_ip":
+            reason = (f"{len(qualifying)} failed-login events shared validated source IP {identity[1]} "
+                      "within the configured time window, across the observed account/host values.")
+            summary = identity[1]
+        else:
+            reason = (f"{len(qualifying)} failed-login events shared host and username identity "
+                      "within the configured time window; no valid source IP was available.")
+            summary = f"host={identity[1]}; username={identity[2]}"
+        results.append(_detection("REPEATED_FAILED_LOGINS", "Repeated failed logins", "HIGH",
+                                   reason, qualifying, summary))
     for failure in failed:
         for success in successful:
             if not (failure.source_ip or failure.username or failure.host):

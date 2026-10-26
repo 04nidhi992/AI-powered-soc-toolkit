@@ -1,7 +1,7 @@
 """Streamlit dashboard. Streamlit/Plotly are imported only when the app is launched."""
 
-from datetime import datetime, timezone
 from dataclasses import replace
+import html
 import json
 import os
 from pathlib import Path
@@ -12,18 +12,81 @@ from soc_toolkit.config import DEFAULT_CONFIG
 from soc_toolkit.correlation import correlate_events
 from soc_toolkit.detection import detect_events, detect_process_reviews, detect_system_metrics
 from soc_toolkit.investigation import add_investigation_note, create_incident, incident_timeline
+from soc_toolkit.ioc_extraction import extract_iocs_from_events
 from soc_toolkit.log_analysis import ingest_log_file
 from soc_toolkit.logging_config import configure_app_logging
 from soc_toolkit.models import SecurityAlert, stable_event_id
 from soc_toolkit.monitoring import collect_processes, collect_system_snapshot
 from soc_toolkit.process_analysis import analyze_processes
 from soc_toolkit.reports import build_case_report
-from soc_toolkit.settings import Thresholds
+from soc_toolkit.settings import DEFAULT_RULES, Thresholds
 from soc_toolkit.storage import Storage
+from soc_toolkit.threat_intel import VirusTotalProvider, enrich_indicators
 
 
-SECTIONS = ("Overview", "System Monitoring", "Process Analysis", "Log Analysis", "Alerts",
+SECTIONS = ("Overview", "System Monitoring", "Process Analysis", "Log Analysis", "Threat Intelligence", "Alerts",
             "Correlation", "Incidents", "Reports", "Settings")
+
+SEVERITY_COLORS = {
+    "INFO": "#60A5FA", "LOW": "#34D399", "MEDIUM": "#FBBF24",
+    "HIGH": "#FB923C", "CRITICAL": "#F87171",
+}
+
+
+def _apply_dashboard_style(st) -> None:
+    st.markdown("""
+    <style>
+      :root { color-scheme: dark; }
+      [data-testid="stAppViewContainer"] { background: #07111F; }
+      [data-testid="stHeader"] { background: rgba(7, 17, 31, .94); }
+      [data-testid="stSidebar"] { background: #0A1728; border-right: 1px solid #20324A; }
+      [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: #A9B9CC; }
+      .block-container { max-width: 1560px; padding-top: 1.5rem; padding-bottom: 3rem; }
+      h1, h2, h3 { color: #F3F7FC; letter-spacing: -0.025em; }
+      p, label, [data-testid="stCaptionContainer"] { color: #A9B9CC; }
+      .soc-kicker { color: #60A5FA; font-size: .72rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; margin-bottom: -.45rem; }
+      .soc-status { background: #101F33; border: 1px solid #263B56; border-radius: 12px; padding: .9rem 1rem; margin-top: 1rem; color: #DCE7F4; font-size: .82rem; }
+      .soc-status small { color: #8FA3BA; display: block; margin-top: .25rem; }
+      .soc-status-dot { color: #34D399; padding-right: .4rem; }
+      .soc-section { border-bottom: 1px solid #20324A; padding: .2rem 0 .85rem; margin: .2rem 0 1.2rem; }
+      .soc-section-label { color: #60A5FA; font-size: .68rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+      .soc-section p { margin: .25rem 0 0; color: #9EB0C5; }
+      [data-testid="stMetric"] { background: #101F33; border: 1px solid #203650; border-radius: 12px; padding: 1rem 1.1rem; min-height: 112px; }
+      [data-testid="stMetricLabel"] { color: #9EB0C5; }
+      [data-testid="stMetricValue"] { color: #F3F7FC; font-weight: 700; }
+      [data-testid="stMetricDelta"] { color: #9EB0C5; }
+      [data-testid="stDataFrame"] { border: 1px solid #203650; border-radius: 10px; overflow: hidden; }
+      [data-testid="stExpander"] { background: #0D1A2B; border: 1px solid #203650; border-radius: 10px; }
+      [data-testid="stAlert"] { border-radius: 10px; }
+      div.stButton > button, [data-testid="stDownloadButton"] button { border-radius: 8px; font-weight: 600; }
+      div.stButton > button[kind="primary"] { background: #2563EB; border-color: #3B82F6; }
+      .severity-badge { display: inline-block; border-radius: 999px; padding: .18rem .58rem; font-size: .72rem; font-weight: 750; letter-spacing: .04em; border: 1px solid currentColor; }
+      .severity-info { color: #60A5FA; background: #102A43; }
+      .severity-low { color: #34D399; background: #123126; }
+      .severity-medium { color: #FBBF24; background: #332713; }
+      .severity-high { color: #FB923C; background: #351E17; }
+      .severity-critical { color: #F87171; background: #35191F; }
+      @media (max-width: 720px) {
+        .block-container { padding-left: 1rem; padding-right: 1rem; }
+        .soc-status { margin-top: .35rem; }
+      }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def _section_header(st, title: str, description: str, label: str = "SOC WORKSPACE") -> None:
+    st.markdown(
+        f'<div class="soc-section"><div class="soc-section-label">{html.escape(label)}</div>'
+        f'<h2>{html.escape(title)}</h2><p>{html.escape(description)}</p></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _severity_badge(severity: str) -> str:
+    normalized = severity.upper()
+    css_class = normalized.casefold() if normalized in SEVERITY_COLORS else "info"
+    return (f'<span class="severity-badge severity-{css_class}">'
+            f'{html.escape(normalized)}</span>')
 
 
 def _persist_detections(storage: Storage, detections) -> int:
@@ -37,34 +100,66 @@ def _persist_detections(storage: Storage, detections) -> int:
     return count
 
 
-def _render_metrics(st, px, alerts):
+def _render_metrics(st, px, storage: Storage):
     snapshot = collect_system_snapshot()
+    try:
+        process_count = len(collect_processes(100))
+    except Exception:
+        process_count = None
     show_percent = lambda value: f"{value:.1f}%" if value is not None else "Unavailable"
+    active_alerts = storage.count_alerts(status="open") + storage.count_alerts(status="investigating")
+    critical_alerts = storage.count_alerts(severity="CRITICAL", status="open") + storage.count_alerts(
+        severity="CRITICAL", status="investigating")
+    columns = st.columns(3)
+    columns[0].metric("Events stored", f"{storage.count_events():,}")
+    columns[1].metric("Active alerts", f"{active_alerts:,}")
+    columns[2].metric("Active critical alerts", f"{critical_alerts:,}")
+    columns = st.columns(2)
+    columns[0].metric("Processes inspected", f"{process_count:,}" if process_count is not None else "Unavailable",
+                      help="Current local process sample, capped at 100 entries.")
+    columns[1].metric("Detection status", "READY" if DEFAULT_RULES else "UNAVAILABLE",
+                      delta=f"{len(DEFAULT_RULES)} configured text rules" if DEFAULT_RULES else None)
+
     columns = st.columns(4)
     columns[0].metric("CPU", show_percent(snapshot.cpu_percent))
     columns[1].metric("Memory", show_percent(snapshot.memory_percent))
     columns[2].metric("Disk", show_percent(snapshot.disk_percent))
     uptime = f"{snapshot.uptime_seconds / 3600:.1f} h" if snapshot.uptime_seconds is not None else "Unavailable"
     columns[3].metric("Uptime", uptime)
-    columns = st.columns(3)
-    for col, status in zip(columns, ("open", "investigating", "resolved")):
-        col.metric(status.replace("_", " ").title(), sum(a.status == status for a in alerts))
-    if alerts:
-        counts = {}
-        for alert in alerts:
-            counts[alert.severity] = counts.get(alert.severity, 0) + 1
-        st.plotly_chart(px.bar(x=list(counts), y=list(counts.values()), labels={"x": "Severity", "y": "Alerts"},
-                               title="Alert severity distribution"), use_container_width=True)
-        st.subheader("Recent detections")
-        st.dataframe([{"Time": a.created_at, "Severity": a.severity, "Rule": a.rule_id,
-                       "Reason": a.reason} for a in alerts[:10]], use_container_width=True)
+
+    severity_order = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    counts = {severity: storage.count_alerts(severity=severity) for severity in severity_order}
+    chart_counts = {severity: count for severity, count in counts.items() if count}
+    if chart_counts:
+        figure = px.bar(x=list(chart_counts), y=list(chart_counts.values()), color=list(chart_counts),
+                        color_discrete_map=SEVERITY_COLORS,
+                        category_orders={"x": severity_order}, labels={"x": "Severity", "y": "Alerts"},
+                        title="Stored alerts by severity")
+        figure.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                             plot_bgcolor="rgba(0,0,0,0)", font_color="#DCE7F4",
+                             margin=dict(l=12, r=12, t=50, b=12), showlegend=False)
+        st.plotly_chart(figure, use_container_width=True)
+        st.subheader("Recent alerts")
+        alerts = storage.list_alerts(limit=10)
+        st.dataframe([{"Time": a.created_at, "Severity": a.severity, "Rule": a.rule_id or a.source,
+                       "Status": a.status, "Reason": Storage._safe_text(a.reason)} for a in alerts],
+                     use_container_width=True, hide_index=True)
     else:
-        st.info("No alerts are stored yet. Refresh system monitoring or import a sample log to begin.")
+        st.info("No alerts are stored yet. Collect a system snapshot or import a synthetic log to begin.")
+    recent_events = storage.list_events(limit=10)
+    st.subheader("Recent security events")
+    if recent_events:
+        st.dataframe([{"Time": item.timestamp, "Source": item.source, "Type": item.event_type,
+                       "Severity": item.severity, "Host": item.host or "Unavailable",
+                       "Message": Storage._safe_text(item.message)} for item in recent_events],
+                     use_container_width=True, hide_index=True)
+    else:
+        st.caption("No events have been imported yet.")
     return snapshot
 
 
 def _render_monitoring(st, storage: Storage):
-    st.subheader("Local system metrics")
+    _section_header(st, "System monitoring", "Live host telemetry and configurable resource thresholds.", "TELEMETRY")
     cpu = st.number_input("CPU warning threshold (%)", 1.0, 100.0, DEFAULT_CONFIG.thresholds.cpu_percent, key="cpu_warning")
     memory = st.number_input("Memory warning threshold (%)", 1.0, 100.0, DEFAULT_CONFIG.thresholds.memory_percent, key="memory_warning")
     disk = st.number_input("Disk warning threshold (%)", 1.0, 100.0, DEFAULT_CONFIG.thresholds.disk_percent, key="disk_warning")
@@ -82,13 +177,19 @@ def _render_monitoring(st, storage: Storage):
         except ValueError as exc:
             st.error(str(exc))
     try:
-        st.dataframe([review.process.__dict__ | {"review_reasons": review.review_reasons}
-                      for review in analyze_processes(collect_processes(30))], use_container_width=True)
+        process_reviews = analyze_processes(collect_processes(30))
+        if process_reviews:
+            st.subheader("Process sample")
+            st.dataframe([review.process.__dict__ | {"review_reasons": review.review_reasons}
+                          for review in process_reviews], use_container_width=True, hide_index=True)
+        else:
+            st.info("No process records were available for this sample.")
     except Exception as exc:
         st.warning(f"Process metrics unavailable: {exc}")
 
 
 def _render_processes(st, storage: Storage):
+    _section_header(st, "Process analysis", "Review the local process sample using configured path indicators.", "HOST REVIEW")
     st.caption("Path indicators request analyst review; names and locations do not prove malicious activity.")
     try:
         paths = tuple(value.strip() for value in st.session_state.get("process_review_paths", ",".join(DEFAULT_CONFIG.process_indicators.review_paths)).split(",") if value.strip())
@@ -105,17 +206,21 @@ def _render_processes(st, storage: Storage):
                 for item in reviews]
         if query:
             rows = [row for row in rows if query.casefold() in json.dumps(row).casefold()]
-        st.dataframe(rows, use_container_width=True)
+        if rows:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("No processes match this filter.")
         st.write(f"{sum(review.requires_review for review in reviews)} process(es) have a configured path indicator.")
     except Exception as exc:
         st.error(f"Could not collect process details: {exc}")
 
 
 def _render_log_ingest(st, storage: Storage):
+    _section_header(st, "Log analysis", "Import supported exported logs and review normalized security events.", "INGESTION")
     st.warning("Imported events are stored locally in the project's SQLite database for correlation and investigation.")
-    uploaded = st.file_uploader("Choose a supported log", type=["log", "txt", "csv", "json", "jsonl", "ndjson", "xml"],
+    uploaded = st.file_uploader("Choose a supported log", type=["log", "txt", "csv", "json", "jsonl", "ndjson", "xml", "evtx"],
                                max_upload_size=10)
-    selected_format = st.selectbox("Format", ["auto", "syslog", "json", "jsonl", "csv", "xml"])
+    selected_format = st.selectbox("Format", ["auto", "syslog", "json", "jsonl", "csv", "xml", "evtx"])
     if uploaded and st.button("Parse and analyze"):
         if uploaded.size > DEFAULT_CONFIG.max_log_bytes:
             st.error(f"The file exceeds {DEFAULT_CONFIG.max_log_bytes:,} bytes.")
@@ -150,6 +255,15 @@ def _render_log_ingest(st, storage: Storage):
                     "username": event.username, "source_ip": event.source_ip,
                     "message": Storage._safe_text(event.message), "evidence_ref": event.evidence_ref}
                     for event in events[:200]], use_container_width=True)
+                indicators = extract_iocs_from_events(list(events))
+                st.subheader("Extracted indicators")
+                st.caption("Indicators are extracted values for analyst review. They are not threat verdicts.")
+                if indicators:
+                    st.dataframe([{"type": item.indicator_type, "value": item.value,
+                        "classification": item.classification, "scope": item.scope,
+                        "evidence_refs": item.evidence_refs} for item in indicators], use_container_width=True)
+                else:
+                    st.info("No supported indicators were extracted from these events.")
             if detections:
                 st.dataframe([{"rule_id": d.rule_id, "rule_name": d.rule_name, "severity": d.severity,
                     "reason": Storage._safe_text(d.reason), "evidence_summary": Storage._safe_text(d.evidence_summary),
@@ -158,7 +272,50 @@ def _render_log_ingest(st, storage: Storage):
             st.error(f"Log ingestion failed: {exc}")
 
 
+def _render_threat_intel(st, storage: Storage):
+    _section_header(st, "Threat intelligence", "Review local indicators and optionally query an external provider.", "ENRICHMENT")
+    st.caption("Offline results only describe locally extracted values. No match or missing intelligence is not evidence that an indicator is benign.")
+    indicators = extract_iocs_from_events(storage.list_events(5000))
+    if not indicators:
+        st.info("Import logs with supported indicators before enrichment.")
+        return
+    st.subheader("Local extraction")
+    st.dataframe([{"type": item.indicator_type, "value": item.value,
+        "classification": item.classification, "scope": item.scope,
+        "evidence_refs": item.evidence_refs} for item in indicators], use_container_width=True)
+    offline = enrich_indicators(indicators)
+    st.dataframe([{"indicator": item.indicator_value, "source": item.source,
+        "lookup_time": item.lookup_time, "status": item.status, "confidence": "Not provided",
+        "summary": item.summary} for item in offline], use_container_width=True)
+
+    mode = st.radio("Enrichment mode", ["Offline (local only)", "VirusTotal (external lookup)"], horizontal=True)
+    if mode == "Offline (local only)":
+        return
+    st.warning("A lookup discloses the selected indicator to VirusTotal, which may add queried IOCs to its shared dataset. No files or event text are sent. URLs with paths, credentials, queries, or fragments, plus private/internal indicators, are skipped.")
+    selected = st.selectbox("Indicator to look up", indicators,
+        format_func=lambda item: f"{item.indicator_type}: {item.value}")
+    consent = st.checkbox("I confirm this indicator is not sensitive, confidential, or personally identifying, and consent to its disclosure to VirusTotal")
+    if st.button("Look up selected indicator", disabled=not consent):
+        provider = st.session_state.get("_soc_virustotal_provider")
+        if provider is None:
+            provider = VirusTotalProvider(timeout_seconds=DEFAULT_CONFIG.threat_intel_timeout_seconds,
+                minimum_interval_seconds=DEFAULT_CONFIG.threat_intel_min_interval_seconds)
+            st.session_state["_soc_virustotal_provider"] = provider
+        st.session_state["_soc_threat_intel_result"] = enrich_indicators(
+            (selected,), provider, external_enabled=True, explicit_consent=consent)[0]
+    result = st.session_state.get("_soc_threat_intel_result")
+    if result:
+        st.subheader("Latest lookup")
+        st.write(f"**Source:** {result.source}  ·  **Lookup time:** {result.lookup_time}  ·  **Status:** {result.status}")
+        st.write(f"**Confidence:** {result.confidence if result.confidence is not None else 'Not provided'}")
+        st.write(result.summary)
+        if result.details:
+            st.json(result.details)
+        st.caption(f"Evidence references: {', '.join(result.evidence_refs) or 'None'}")
+
+
 def _render_alerts(st, storage: Storage):
+    _section_header(st, "Security alerts", "Triage explainable detections and record alert status changes.", "TRIAGE")
     left, right = st.columns(2)
     severity = left.selectbox("Severity", ["All", "INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"])
     status = right.selectbox("Status", ["All", "open", "investigating", "resolved", "false_positive"])
@@ -169,6 +326,7 @@ def _render_alerts(st, storage: Storage):
         return
     for alert in alerts:
         with st.expander(f"{alert.severity} | {alert.rule_id or alert.source} | {alert.created_at}"):
+            st.markdown(_severity_badge(alert.severity), unsafe_allow_html=True)
             st.text(alert.message)
             st.text(f"Reason: {alert.reason}")
             st.write(f"**Status:** {alert.status}")
@@ -186,6 +344,7 @@ def _render_alerts(st, storage: Storage):
 
 
 def _render_correlation(st, storage: Storage):
+    _section_header(st, "Event correlation", "Groups require shared identity or network evidence inside the selected window.", "INVESTIGATION")
     default_window = int(st.session_state.get("configured_correlation_window", DEFAULT_CONFIG.correlation_window_seconds))
     seconds = st.number_input("Correlation window (seconds)", 60, 86400,
                               default_window, step=60, key="correlation_window_active")
@@ -198,6 +357,7 @@ def _render_correlation(st, storage: Storage):
 
 
 def _render_incidents(st, storage: Storage):
+    _section_header(st, "Incident investigations", "Link evidence, document observations, and track case status.", "CASE MANAGEMENT")
     alerts = storage.list_alerts(limit=1000)
     events = storage.list_events(2000)
     alert_map = {item.alert_id: item for item in alerts}
@@ -242,6 +402,7 @@ def _render_incidents(st, storage: Storage):
 
 
 def _render_reports(st, storage: Storage):
+    _section_header(st, "Incident reports", "Build portable case reports with configurable username and IP redaction.", "REPORTING")
     incidents = storage.list_incidents()
     if not incidents:
         st.info("Create an incident before generating a case report.")
@@ -267,23 +428,45 @@ def main() -> None:
     except ImportError as exc:
         raise RuntimeError("Install dashboard dependencies with: python -m pip install -r requirements.txt") from exc
     st.set_page_config(page_title="AI-Powered SOC Toolkit", layout="wide")
+    _apply_dashboard_style(st)
     logger = configure_app_logging()
-    st.title("AI-Powered SOC Toolkit")
-    st.caption("Defensive local monitoring and triage. Detections are review leads, not proof of compromise.")
     @st.cache_resource
     def get_storage(path: str) -> Storage:
         return Storage(path)
     storage = get_storage(str(DEFAULT_CONFIG.database_path))
-    section = st.sidebar.radio("Workspace", SECTIONS)
+    st.sidebar.markdown(
+        '<div class="soc-kicker">🛡 SOC TOOLKIT</div>'
+        '<p style="margin-top:.65rem;font-weight:700;color:#EAF2FC">ANALYST WORKSPACE</p>',
+        unsafe_allow_html=True,
+    )
+    header, status = st.columns([4, 1])
+    with header:
+        st.markdown('<div class="soc-kicker">SECURITY OPERATIONS CENTER</div>', unsafe_allow_html=True)
+        st.title("AI-Powered SOC Toolkit")
+        st.caption("Local defensive monitoring and triage · Detection matches are review leads, not proof of compromise.")
+    with status:
+        st.markdown(
+            '<div class="soc-status"><span class="soc-status-dot">●</span>LOCAL WORKSPACE'
+            '<small>Application storage ready</small></div>',
+            unsafe_allow_html=True,
+        )
+    icons = {"Overview": "▦", "System Monitoring": "◉", "Process Analysis": "⌘",
+             "Log Analysis": "≋", "Threat Intelligence": "◎", "Alerts": "⚑", "Correlation": "⌁",
+             "Incidents": "▣", "Reports": "▤", "Settings": "⚙"}
+    section = st.sidebar.radio("Workspace", SECTIONS,
+                               format_func=lambda value: f"{icons.get(value, '•')}  {value}")
     try:
         if section == "Overview":
-            _render_metrics(st, px, storage.list_alerts(limit=500))
+            _section_header(st, "Security overview", "Current local telemetry, stored events, and alert posture.", "SOC OVERVIEW")
+            _render_metrics(st, px, storage)
         elif section == "System Monitoring":
             _render_monitoring(st, storage)
         elif section == "Process Analysis":
             _render_processes(st, storage)
         elif section == "Log Analysis":
             _render_log_ingest(st, storage)
+        elif section == "Threat Intelligence":
+            _render_threat_intel(st, storage)
         elif section == "Alerts":
             _render_alerts(st, storage)
         elif section == "Correlation":
@@ -293,7 +476,7 @@ def main() -> None:
         elif section == "Reports":
             _render_reports(st, storage)
         elif section == "Settings":
-            st.subheader("Application settings")
+            _section_header(st, "Application settings", "Session thresholds, detection behavior, and optional integrations.", "CONFIGURATION")
             st.number_input("CPU warning threshold (%)", 1.0, 100.0, DEFAULT_CONFIG.thresholds.cpu_percent, key="cpu_warning")
             st.number_input("Memory warning threshold (%)", 1.0, 100.0, DEFAULT_CONFIG.thresholds.memory_percent, key="memory_warning")
             st.number_input("Disk warning threshold (%)", 1.0, 100.0, DEFAULT_CONFIG.thresholds.disk_percent, key="disk_warning")
