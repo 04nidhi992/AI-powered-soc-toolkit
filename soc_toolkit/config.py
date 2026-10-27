@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from .settings import ProcessIndicators, Thresholds
+from .settings import ProcessIndicators, ThreatScoringConfig, Thresholds
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,7 @@ class AppConfig:
     threat_intel_min_interval_seconds: float = 15.0
     thresholds: Thresholds = Thresholds()
     process_indicators: ProcessIndicators = ProcessIndicators()
+    threat_scoring: ThreatScoringConfig = ThreatScoringConfig()
     report_redact_ips: bool = False
     report_redact_usernames: bool = True
 

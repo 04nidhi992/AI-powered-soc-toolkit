@@ -55,6 +55,15 @@ def offline_result(indicator: ExtractedIndicator) -> EnrichmentResult:
         f"Extracted indicator; local scope is {indicator.scope}. No reputation lookup was performed.")
 
 
+def _is_internal_or_example_domain(value: str) -> bool:
+    domain = value.casefold().rstrip(".")
+    reserved_suffixes = (".local", ".internal", ".lan", ".corp", ".home", ".localhost",
+                         ".test", ".invalid", ".example", ".example.com", ".example.net",
+                         ".example.org")
+    return ("." not in domain or domain.endswith(reserved_suffixes)
+            or domain in {"example.com", "example.net", "example.org"})
+
+
 def _external_lookup_allowed(indicator: ExtractedIndicator) -> tuple[bool, str]:
     kind, value = indicator.indicator_type, indicator.value
     if kind in {"IPv4", "IPv6"}:
@@ -67,10 +76,8 @@ def _external_lookup_allowed(indicator: ExtractedIndicator) -> tuple[bool, str]:
         return True, ""
     if kind == "DOMAIN":
         domain = value.casefold().rstrip(".")
-        if "." not in domain or domain.endswith((".local", ".internal", ".lan", ".corp", ".home", ".localhost", ".test", ".invalid", ".example")):
+        if _is_internal_or_example_domain(domain):
             return False, "Internal or example domain; external lookup skipped."
-        if domain in {"example.com", "example.net", "example.org"}:
-            return False, "Example domain; external lookup skipped."
         return True, ""
     if kind == "URL":
         try:
@@ -85,7 +92,7 @@ def _external_lookup_allowed(indicator: ExtractedIndicator) -> tuple[bool, str]:
                 if not address.is_global:
                     return False, "URL host is a private, reserved, or non-global IP; external lookup skipped."
             except ValueError:
-                if "." not in host or host.casefold().endswith((".local", ".internal", ".lan", ".corp", ".home", ".localhost", ".test", ".invalid", ".example")):
+                if _is_internal_or_example_domain(host):
                     return False, "URL host appears internal or reserved; external lookup skipped."
         except ValueError:
             return False, "Invalid URL; external lookup skipped."
@@ -164,9 +171,18 @@ class VirusTotalProvider:
             return _result(indicator, self.source, "unavailable", "Provider is unavailable or the network request failed.")
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return _result(indicator, self.source, "error", "Provider returned an invalid response.")
-        attributes = decoded.get("data", {}).get("attributes", {}) if isinstance(decoded, dict) else {}
-        stats = attributes.get("last_analysis_stats", {}) if isinstance(attributes, dict) else {}
-        stats = {key: int(stats.get(key, 0)) for key in ("malicious", "suspicious", "harmless", "undetected")}
+        data = decoded.get("data") if isinstance(decoded, dict) else None
+        attributes = data.get("attributes") if isinstance(data, dict) else None
+        if not isinstance(attributes, dict):
+            return _result(indicator, self.source, "error", "Provider returned an invalid response.")
+        raw_stats = attributes.get("last_analysis_stats", {})
+        if not isinstance(raw_stats, dict):
+            return _result(indicator, self.source, "error", "Provider returned an invalid response.")
+        try:
+            stats = {key: int(raw_stats.get(key, 0))
+                     for key in ("malicious", "suspicious", "harmless", "undetected")}
+        except (TypeError, ValueError, OverflowError):
+            return _result(indicator, self.source, "error", "Provider returned an invalid response.")
         return _result(indicator, self.source, "found",
             f"Provider reports {stats['malicious']} malicious and {stats['suspicious']} suspicious detections.",
             details={"last_analysis_stats": stats, "reputation": attributes.get("reputation")})

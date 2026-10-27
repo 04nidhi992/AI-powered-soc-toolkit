@@ -11,11 +11,19 @@ import threading
 from typing import Iterator
 import uuid
 
-from .models import DetectionResult, Incident, InvestigationNote, NormalizedEvent, SecurityAlert
+from .models import AIActivityRecord, AnalystReview, DetectionResult, Incident, InvestigationNote, NormalizedEvent, SecurityAlert
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ALERT_STATUSES = {"open", "investigating", "resolved", "false_positive"}
+REVIEW_DECISIONS = {"confirmed", "false_positive", "needs_review", "dismissed"}
+REVIEW_TRANSITIONS = {
+    None: REVIEW_DECISIONS,
+    "needs_review": {"confirmed", "false_positive", "dismissed"},
+    "confirmed": {"needs_review", "false_positive", "dismissed"},
+    "false_positive": {"needs_review", "confirmed", "dismissed"},
+    "dismissed": {"needs_review"},
+}
 
 
 class Storage:
@@ -81,7 +89,21 @@ class Storage:
                     change_id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
                     old_status TEXT, new_status TEXT NOT NULL, changed_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 1;
+                CREATE TABLE IF NOT EXISTS analyst_reviews (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT, review_id TEXT NOT NULL UNIQUE,
+                    subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, decision TEXT NOT NULL,
+                    reviewed_at TEXT NOT NULL, analyst TEXT, notes TEXT NOT NULL,
+                    case_refs_json TEXT NOT NULL, evidence_refs_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_analyst_reviews_subject ON analyst_reviews(subject_type, subject_id, sequence);
+                CREATE TABLE IF NOT EXISTS ai_activity (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT, activity_id TEXT NOT NULL UNIQUE,
+                    provider TEXT NOT NULL, model TEXT NOT NULL, request_time TEXT NOT NULL,
+                    status TEXT NOT NULL, safe_summary TEXT NOT NULL, case_refs_json TEXT NOT NULL,
+                    evidence_refs_json TEXT NOT NULL, transmitted_fields_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ai_activity_time ON ai_activity(request_time);
+                PRAGMA user_version = 2;
                 COMMIT;
             """)
 
@@ -94,6 +116,14 @@ class Storage:
         value = re.sub(r"(?i)(\\users\\)[^\\\s]+", r"\1[REDACTED]", value)
         value = re.sub(r"(?i)(/home/)[^/\s]+", r"\1[REDACTED]", value)
         return value[:2000]
+
+    @staticmethod
+    def _safe_audit_text(value: str | None, limit: int = 2000) -> str:
+        """Sanitize audit metadata and summaries without retaining secrets or prompt bodies."""
+        safe = Storage._safe_text(value or "")
+        safe = re.sub(r"(?i)\bbearer\s+\S+", "Bearer [REDACTED]", safe)
+        safe = re.sub(r"(?i)\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{12,}|xox[baprs]-[A-Za-z0-9-]{12,}|AKIA[A-Z0-9]{16})\b", "[REDACTED_SECRET]", safe)
+        return safe[:limit]
 
     @staticmethod
     def _event_key(event: NormalizedEvent) -> str:
@@ -278,6 +308,73 @@ class Storage:
                                            (incident_id,)).fetchall()
         return [InvestigationNote(row["note_id"], row["incident_id"], row["created_at"], row["author"],
                                   row["category"], row["content"]) for row in rows]
+
+    @staticmethod
+    def _review(row: sqlite3.Row) -> AnalystReview:
+        return AnalystReview(row["review_id"], row["subject_type"], row["subject_id"], row["decision"],
+            row["reviewed_at"], row["analyst"], row["notes"], tuple(json.loads(row["case_refs_json"])),
+            tuple(json.loads(row["evidence_refs_json"])))
+
+    def list_analyst_reviews(self, subject_type: str, subject_id: str) -> list[AnalystReview]:
+        with self._lock:
+            rows = self.connection.execute("SELECT * FROM analyst_reviews WHERE subject_type = ? AND subject_id = ? ORDER BY sequence",
+                                           (subject_type, subject_id)).fetchall()
+        return [self._review(row) for row in rows]
+
+    def latest_analyst_review(self, subject_type: str, subject_id: str) -> AnalystReview | None:
+        reviews = self.list_analyst_reviews(subject_type, subject_id)
+        return reviews[-1] if reviews else None
+
+    def add_analyst_review(self, review: AnalystReview) -> None:
+        with self.transaction() as db:
+            prior = db.execute("SELECT decision FROM analyst_reviews WHERE subject_type = ? AND subject_id = ? ORDER BY sequence DESC LIMIT 1",
+                               (review.subject_type, review.subject_id)).fetchone()
+            old_decision = prior["decision"] if prior else None
+            if review.decision not in REVIEW_TRANSITIONS.get(old_decision, set()):
+                raise ValueError(f"Invalid review transition: {old_decision or 'unreviewed'} -> {review.decision}")
+            safe_analyst = self._safe_audit_text(review.analyst, 200) or None
+            safe_notes = self._safe_audit_text(review.notes)
+            safe_case_refs = [self._safe_audit_text(ref, 300) for ref in review.case_refs]
+            safe_evidence_refs = [self._safe_audit_text(ref, 500) for ref in review.evidence_refs]
+            db.execute("INSERT INTO analyst_reviews (review_id, subject_type, subject_id, decision, reviewed_at, analyst, notes, case_refs_json, evidence_refs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (review.review_id, review.subject_type, self._safe_audit_text(review.subject_id, 300), review.decision,
+                 review.reviewed_at, safe_analyst, safe_notes, json.dumps(safe_case_refs), json.dumps(safe_evidence_refs)))
+            db.execute("INSERT INTO status_changes VALUES (?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), "analyst_review", f"{review.subject_type}:{review.subject_id}", old_decision,
+                 review.decision, review.reviewed_at))
+
+    def list_case_analyst_reviews(self, incident_id: str) -> list[AnalystReview]:
+        with self._lock:
+            rows = self.connection.execute("SELECT * FROM analyst_reviews ORDER BY sequence").fetchall()
+        return [self._review(row) for row in rows if incident_id in json.loads(row["case_refs_json"])]
+
+    @staticmethod
+    def _ai_activity(row: sqlite3.Row) -> AIActivityRecord:
+        return AIActivityRecord(row["activity_id"], row["provider"], row["model"], row["request_time"],
+            row["status"], row["safe_summary"], tuple(json.loads(row["case_refs_json"])),
+            tuple(json.loads(row["evidence_refs_json"])), tuple(json.loads(row["transmitted_fields_json"])))
+
+    def add_ai_activity(self, activity: AIActivityRecord) -> None:
+        with self.transaction() as db:
+            db.execute("INSERT INTO ai_activity (activity_id, provider, model, request_time, status, safe_summary, case_refs_json, evidence_refs_json, transmitted_fields_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (activity.activity_id, self._safe_audit_text(activity.provider, 100),
+                 self._safe_audit_text(activity.model, 100), activity.request_time, activity.status,
+                 self._safe_audit_text(activity.safe_summary),
+                 json.dumps([self._safe_audit_text(ref, 300) for ref in activity.case_refs]),
+                 json.dumps([self._safe_audit_text(ref, 500) for ref in activity.evidence_refs]),
+                 json.dumps([self._safe_audit_text(value, 100) for value in activity.transmitted_fields])))
+
+    def list_ai_activity(self, incident_id: str | None = None) -> list[AIActivityRecord]:
+        with self._lock:
+            rows = self.connection.execute("SELECT * FROM ai_activity ORDER BY sequence").fetchall()
+        records = [self._ai_activity(row) for row in rows]
+        return [record for record in records if incident_id in record.case_refs] if incident_id else records
+
+    def list_status_history(self, entity_type: str, entity_id: str) -> list[dict[str, str | None]]:
+        with self._lock:
+            rows = self.connection.execute("SELECT old_status, new_status, changed_at FROM status_changes WHERE entity_type = ? AND entity_id = ? ORDER BY changed_at, rowid",
+                                           (entity_type, entity_id)).fetchall()
+        return [dict(row) for row in rows]
 
     def close(self) -> None:
         with self._lock:

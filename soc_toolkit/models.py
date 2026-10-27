@@ -218,6 +218,7 @@ class Incident:
             raise ValueError("Incident title is required")
         if self.status not in {"open", "investigating", "resolved", "false_positive"}:
             raise ValueError(f"Unsupported incident status: {self.status}")
+        object.__setattr__(self, "created_at", _normalize_iso_timestamp(self.created_at, "Incident timestamp"))
 
 
 @dataclass(frozen=True)
@@ -234,6 +235,63 @@ class InvestigationNote:
             raise ValueError(f"Unsupported investigation note category: {self.category}")
         if not self.content.strip():
             raise ValueError("Investigation note content is required")
+        object.__setattr__(self, "created_at", _normalize_iso_timestamp(self.created_at, "Investigation note timestamp"))
+
+
+@dataclass(frozen=True)
+class AnalystReview:
+    review_id: str
+    subject_type: str
+    subject_id: str
+    decision: str
+    reviewed_at: str
+    analyst: str | None = None
+    notes: str = ""
+    case_refs: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.subject_type not in {"alert", "detection", "finding"}:
+            raise ValueError("Unsupported analyst review subject type")
+        if not self.subject_id.strip():
+            raise ValueError("Analyst review subject ID is required")
+        if self.decision not in {"confirmed", "false_positive", "needs_review", "dismissed"}:
+            raise ValueError("Unsupported analyst review decision")
+        object.__setattr__(self, "reviewed_at", _normalize_iso_timestamp(self.reviewed_at, "Review timestamp"))
+        if self.analyst is not None and not isinstance(self.analyst, str):
+            raise ValueError("analyst must be text or None")
+        for field_name in ("case_refs", "evidence_refs"):
+            values = getattr(self, field_name)
+            if not isinstance(values, (tuple, list)) or any(not isinstance(value, str) or not value.strip() for value in values):
+                raise ValueError(f"{field_name} must contain non-empty text references")
+            object.__setattr__(self, field_name, tuple(dict.fromkeys(values)))
+
+
+@dataclass(frozen=True)
+class AIActivityRecord:
+    activity_id: str
+    provider: str
+    model: str
+    request_time: str
+    status: str
+    safe_summary: str
+    case_refs: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    transmitted_fields: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.activity_id.strip() or not self.provider.strip() or not self.model.strip():
+            raise ValueError("AI activity ID, provider, and model are required")
+        if self.status not in {"offline", "suggestion", "failed"}:
+            raise ValueError("Unsupported AI activity status")
+        if not self.safe_summary.strip():
+            raise ValueError("AI activity summary is required")
+        object.__setattr__(self, "request_time", _normalize_iso_timestamp(self.request_time, "AI request time"))
+        for field_name in ("case_refs", "evidence_refs", "transmitted_fields"):
+            values = getattr(self, field_name)
+            if not isinstance(values, (tuple, list)) or any(not isinstance(value, str) or not value.strip() for value in values):
+                raise ValueError(f"{field_name} must contain non-empty text references")
+            object.__setattr__(self, field_name, tuple(dict.fromkeys(values)))
 
 
 @dataclass(frozen=True)

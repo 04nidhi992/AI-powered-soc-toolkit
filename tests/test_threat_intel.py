@@ -59,6 +59,20 @@ class VirusTotalEnrichmentTests(unittest.TestCase):
                 patch("soc_toolkit.threat_intel.urlopen", side_effect=OSError()):
             self.assertEqual("unavailable", self.provider().lookup(self.indicator).status)
 
+    def test_malformed_provider_json_shapes_return_safe_error(self):
+        payloads = (
+            {"data": "unexpected"},
+            {"data": {"attributes": {"last_analysis_stats": []}}},
+            {"data": {"attributes": {"last_analysis_stats": {"malicious": "not-a-count"}}}},
+        )
+        with patch.dict(os.environ, {"SOC_TEST_VT_KEY": "test-secret"}):
+            for payload in payloads:
+                with self.subTest(payload=payload), patch(
+                        "soc_toolkit.threat_intel.urlopen", return_value=self.response(payload)):
+                    result = self.provider().lookup(self.indicator)
+                self.assertEqual("error", result.status)
+                self.assertEqual("Provider returned an invalid response.", result.summary)
+
     def test_missing_credentials_and_offline_mode_make_no_request(self):
         with patch.dict(os.environ, {}, clear=True), patch("soc_toolkit.threat_intel.urlopen") as open_url:
             missing = self.provider().lookup(self.indicator)
@@ -82,6 +96,18 @@ class VirusTotalEnrichmentTests(unittest.TestCase):
             results = tuple(self.provider().lookup(item) for item in indicators)
         open_url.assert_not_called()
         self.assertTrue(all(item.status == "skipped_sensitive" for item in results))
+
+    def test_example_domain_and_url_subdomains_are_never_sent(self):
+        indicators = (
+            ExtractedIndicator("DOMAIN", "sub.example.org", ("dns:4",)),
+            ExtractedIndicator("URL", "https://sub.example.com/", ("web:5",)),
+        )
+        with patch.dict(os.environ, {"SOC_TEST_VT_KEY": "test-secret"}), \
+                patch("soc_toolkit.threat_intel.urlopen") as open_url:
+            results = tuple(self.provider().lookup(item) for item in indicators)
+        open_url.assert_not_called()
+        self.assertTrue(all(item.status == "skipped_sensitive" for item in results))
+        self.assertTrue(all("reserved" in item.summary or "example" in item.summary for item in results))
 
     def test_local_request_interval_prevents_provider_burst(self):
         body = {"data": {"attributes": {"last_analysis_stats": {}}}}

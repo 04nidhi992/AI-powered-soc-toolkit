@@ -1,27 +1,31 @@
 """Streamlit dashboard. Streamlit/Plotly are imported only when the app is launched."""
 
 from dataclasses import replace
+from datetime import datetime, timezone
 import html
 import json
 import os
 from pathlib import Path
 import tempfile
 
-from soc_toolkit.ai_analysis import OpenAICompatibleProvider, explain_alert, sanitize_ai_payload
+from soc_toolkit.ai_analysis import OpenAICompatibleProvider, build_investigation_summary, sanitize_ai_payload, sanitize_ai_text
+from soc_toolkit.attack_mapping import assess_detection_mapping
 from soc_toolkit.config import DEFAULT_CONFIG
 from soc_toolkit.correlation import correlate_events
 from soc_toolkit.detection import detect_events, detect_process_reviews, detect_system_metrics
-from soc_toolkit.investigation import add_investigation_note, create_incident, incident_timeline
+from soc_toolkit.investigation import (add_investigation_note, allowed_review_decisions,
+    create_incident, incident_timeline, record_ai_activity, record_analyst_review)
 from soc_toolkit.ioc_extraction import extract_iocs_from_events
 from soc_toolkit.log_analysis import ingest_log_file
 from soc_toolkit.logging_config import configure_app_logging
 from soc_toolkit.models import SecurityAlert, stable_event_id
 from soc_toolkit.monitoring import collect_processes, collect_system_snapshot
 from soc_toolkit.process_analysis import analyze_processes
-from soc_toolkit.reports import build_case_report
+from soc_toolkit.reports import build_case_report, generate_pdf_case_report
 from soc_toolkit.settings import DEFAULT_RULES, Thresholds
 from soc_toolkit.storage import Storage
 from soc_toolkit.threat_intel import VirusTotalProvider, enrich_indicators
+from soc_toolkit.threat_scoring import score_threat
 
 
 SECTIONS = ("Overview", "System Monitoring", "Process Analysis", "Log Analysis", "Threat Intelligence", "Alerts",
@@ -316,6 +320,9 @@ def _render_threat_intel(st, storage: Storage):
 
 def _render_alerts(st, storage: Storage):
     _section_header(st, "Security alerts", "Triage explainable detections and record alert status changes.", "TRIAGE")
+    flash_global = st.session_state.pop("review_saved_message", None)
+    if flash_global:
+        st.success(flash_global)
     left, right = st.columns(2)
     severity = left.selectbox("Severity", ["All", "INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"])
     status = right.selectbox("Status", ["All", "open", "investigating", "resolved", "false_positive"])
@@ -324,8 +331,10 @@ def _render_alerts(st, storage: Storage):
     if not alerts:
         st.info("No alerts match these filters.")
         return
+    saved_alert_id = st.session_state.pop("review_saved_alert_id", None)
     for alert in alerts:
-        with st.expander(f"{alert.severity} | {alert.rule_id or alert.source} | {alert.created_at}"):
+        is_expanded = bool(st.session_state.get(f"show_analysis_{alert.alert_id}") or (saved_alert_id == alert.alert_id))
+        with st.expander(f"{alert.severity} | {alert.rule_id or alert.source} | {alert.created_at}", expanded=is_expanded):
             st.markdown(_severity_badge(alert.severity), unsafe_allow_html=True)
             st.text(alert.message)
             st.text(f"Reason: {alert.reason}")
@@ -335,6 +344,179 @@ def _render_alerts(st, storage: Storage):
                 st.write("**Investigation steps**")
                 for step in alert.recommended_steps:
                     st.write(f"- {step}")
+
+            # Analyze action and output
+            if st.button("Analyze", key=f"btn-analyze-{alert.alert_id}"):
+                st.session_state[f"show_analysis_{alert.alert_id}"] = True
+
+            if st.session_state.get(f"show_analysis_{alert.alert_id}"):
+                st.markdown("---")
+                st.subheader(f"Alert Analysis · {alert.rule_id or alert.source}")
+                all_events = storage.list_events(5000)
+                groups = correlate_events(all_events, DEFAULT_CONFIG.correlation_window_seconds)
+                summary = build_investigation_summary(
+                    alert=alert,
+                    events=all_events,
+                    incident=None,
+                    correlation_groups=groups,
+                    provider=None,
+                    enabled=False,
+                    explicit_consent=False,
+                    selected_evidence=(),
+                )
+                st.markdown(f"**Severity:** {_severity_badge(alert.severity)} · **Rule ID:** `{alert.rule_id or 'unspecified'}`", unsafe_allow_html=True)
+                st.write(f"**Detection explanation:** {alert.reason or alert.message}")
+                if alert.message and alert.message != alert.reason:
+                    st.caption(f"Alert message: {alert.message}")
+
+                st.markdown("**Supporting evidence**")
+                if summary.supporting_evidence:
+                    st.dataframe([
+                        {
+                            "event_id": item.event_id,
+                            "source": item.source,
+                            "timestamp": item.timestamp,
+                            "event_type": item.event_type,
+                            "message": item.message,
+                            "evidence_refs": ", ".join(item.evidence_refs) if isinstance(item.evidence_refs, (tuple, list)) else str(item.evidence_refs),
+                        }
+                        for item in summary.supporting_evidence
+                    ], use_container_width=True, hide_index=True)
+                else:
+                    st.info("No matching event records were resolved for this alert's evidence references.")
+
+                # Related events sharing host, username, or source IP
+                evidence_ref_set = set(alert.evidence_refs)
+                target_ips = set()
+                target_users = set()
+                target_hosts = set()
+                for ev in all_events:
+                    if ev.event_id in evidence_ref_set or ev.evidence_ref in evidence_ref_set:
+                        if ev.source_ip: target_ips.add(ev.source_ip)
+                        if ev.username: target_users.add(ev.username)
+                        if ev.host: target_hosts.add(ev.host)
+
+                related_events = []
+                for ev in all_events:
+                    if ev.event_id not in evidence_ref_set and ev.evidence_ref not in evidence_ref_set:
+                        if (ev.source_ip and ev.source_ip in target_ips) or \
+                           (ev.username and ev.username in target_users) or \
+                           (ev.host and ev.host in target_hosts):
+                            related_events.append(ev)
+
+                if related_events:
+                    st.markdown("**Related events (shared host, user, or IP)**")
+                    st.dataframe([
+                        {
+                            "time": ev.timestamp,
+                            "source": ev.source,
+                            "type": ev.event_type,
+                            "host": ev.host or "—",
+                            "user": ev.username or "—",
+                            "ip": ev.source_ip or "—",
+                            "message": Storage._safe_text(ev.message),
+                            "evidence_ref": ev.evidence_ref,
+                        }
+                        for ev in related_events[:10]
+                    ], use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No additional related events found sharing host, user, or IP.")
+
+                st.markdown("**Recommended investigation steps**")
+                steps = summary.recommended_next_steps or alert.recommended_steps
+                if steps:
+                    for step in steps:
+                        st.write(f"- {step}")
+                else:
+                    st.caption("No specific automated investigation steps were generated for this rule.")
+
+                if summary.potential_technique_matches:
+                    st.markdown("**MITRE ATT&CK mapping**")
+                    st.dataframe([
+                        {
+                            "status": m.mapping_status,
+                            "technique_id": m.technique_id,
+                            "technique": m.technique_name,
+                            "tactic": m.tactic,
+                            "qualification": m.qualification,
+                            "explanation": m.explanation,
+                            "evidence_refs": ", ".join(m.evidence_refs) if isinstance(m.evidence_refs, (tuple, list)) else str(m.evidence_refs),
+                        }
+                        for m in summary.potential_technique_matches
+                    ], use_container_width=True, hide_index=True)
+                elif summary.technique_assessment and summary.technique_assessment.explanation:
+                    st.caption(f"MITRE ATT&CK: {summary.technique_assessment.explanation}")
+
+                if summary.uncertainties:
+                    st.markdown("**Analysis notes & limitations**")
+                    for note in summary.uncertainties:
+                        st.write(f"- {note}")
+
+                st.caption("ℹ️ External AI analysis is offline (disabled by default). Local deterministic analysis shown above. Configure an HTTPS endpoint and API key in Settings to request optional external AI hypotheses.")
+
+                if st.button("Hide analysis", key=f"btn-hide-analysis-{alert.alert_id}"):
+                    st.session_state[f"show_analysis_{alert.alert_id}"] = False
+                    st.rerun()
+                st.markdown("---")
+
+            # Analyst review section
+            flash_alert = st.session_state.pop(f"review_saved_{alert.alert_id}", None)
+            if flash_alert:
+                st.success(flash_alert)
+
+            reviews = storage.list_analyst_reviews("alert", alert.alert_id)
+            latest_review = reviews[-1] if reviews else None
+            if latest_review:
+                st.write(f"**Latest analyst decision:** {latest_review.decision} · {latest_review.reviewed_at}")
+            with st.form(f"analyst-review-{alert.alert_id}"):
+                decisions = allowed_review_decisions(latest_review.decision if latest_review else None)
+                if not decisions:
+                    st.info("No further review transitions are permitted for this alert.")
+                    submit_review = False
+                else:
+                    decision = st.selectbox("Analyst decision", decisions, key=f"review-decision-{alert.alert_id}")
+                    analyst = st.text_input("Analyst identity (optional; stored only if provided)", key=f"review-analyst-{alert.alert_id}")
+                    review_notes = st.text_area("Review notes", key=f"review-notes-{alert.alert_id}")
+                    submit_review = st.form_submit_button("Record analyst review")
+
+            if submit_review:
+                case_refs = tuple(
+                    incident.incident_id
+                    for incident in storage.list_incidents()
+                    if alert.alert_id in incident.alert_ids
+                )
+                submission_key = (alert.alert_id, decision, (analyst or "").strip(), review_notes.strip())
+                if st.session_state.get(f"_last_review_submitted_{alert.alert_id}") == submission_key:
+                    st.info("This exact analyst review was already submitted.")
+                else:
+                    try:
+                        saved_review = record_analyst_review(
+                            storage,
+                            "alert",
+                            alert.alert_id,
+                            decision,
+                            analyst=analyst or None,
+                            notes=review_notes,
+                            case_refs=case_refs,
+                            evidence_refs=alert.evidence_refs,
+                        )
+                        st.session_state[f"_last_review_submitted_{alert.alert_id}"] = submission_key
+                        success_msg = f"Analyst review recorded: {saved_review.decision}"
+                        st.session_state["review_saved_message"] = success_msg
+                        st.session_state[f"review_saved_{alert.alert_id}"] = success_msg
+                        st.session_state["review_saved_alert_id"] = alert.alert_id
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(f"Review validation error: {exc}")
+                    except Exception as exc:
+                        st.error(f"Failed to record analyst review: {exc}")
+
+            if reviews:
+                st.caption("Append-only review history")
+                st.dataframe([{"reviewed_at": item.reviewed_at, "decision": item.decision,
+                    "analyst": item.analyst or "Not provided", "notes": item.notes,
+                    "case_refs": item.case_refs, "evidence_refs": item.evidence_refs}
+                    for item in reviews], use_container_width=True, hide_index=True)
             choice = st.selectbox("Update status", ["open", "investigating", "resolved", "false_positive"],
                                   index=["open", "investigating", "resolved", "false_positive"].index(alert.status),
                                   key=f"status-{alert.alert_id}")
@@ -354,6 +536,40 @@ def _render_correlation(st, storage: Storage):
         st.dataframe([group.__dict__ for group in groups], use_container_width=True)
     else:
         st.info("No groups found. Events must share host, username, or source IP; time proximity alone is not enough.")
+    detections = detect_events(events,
+        repeated_threshold=int(st.session_state.get("repeated_login_threshold", DEFAULT_CONFIG.repeated_failed_login_threshold)),
+        correlation_window_seconds=int(seconds))
+    last_enrichment = st.session_state.get("_soc_threat_intel_result")
+    enrichment = (last_enrichment,) if last_enrichment else ()
+    score = score_threat(events, detections, groups, enrichment, DEFAULT_CONFIG.threat_scoring)
+    st.subheader("Explainable threat score")
+    st.caption("Triage priority only; this is not a probability, attribution, or verdict. Factors are configurable in AppConfig.threat_scoring.")
+    st.metric("Score", f"{score.score}/100 · {score.level}")
+    st.dataframe([{"component": item.name, "points": item.points,
+        "explanation": item.explanation, "evidence_refs": item.evidence_refs}
+        for item in score.components], use_container_width=True, hide_index=True)
+    st.write(f"**Matched rules:** {', '.join(score.matched_rules) or 'None'}")
+    st.write(f"**Evidence references:** {', '.join(score.evidence_refs) or 'None'}")
+    assessments = [assess_detection_mapping(detection, available_events=events)
+        for detection in detections]
+    st.subheader("Potential MITRE ATT&CK technique matches")
+    if assessments:
+        rows = []
+        for assessment in assessments:
+            if assessment.matches:
+                rows.extend({"status": mapping.mapping_status, "technique_id": mapping.technique_id,
+            "technique": mapping.technique_name, "tactic": mapping.tactic,
+            "matched_rule": mapping.rule_id, "explanation": mapping.explanation,
+            "qualification": mapping.qualification, "evidence_refs": mapping.evidence_refs,
+            "source": mapping.source_url} for mapping in assessment.matches)
+            else:
+                rows.append({"status": "unmapped", "technique_id": "", "technique": "", "tactic": "",
+                    "matched_rule": assessment.rule_id, "explanation": assessment.explanation,
+                    "qualification": "", "evidence_refs": assessment.evidence_refs, "source": ""})
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("No detections are available to assess for ATT&CK mappings.")
+    st.caption("Uncertainty: " + " ".join(score.uncertainty))
 
 
 def _render_incidents(st, storage: Storage):
@@ -398,6 +614,20 @@ def _render_incidents(st, storage: Storage):
                     st.rerun()
                 except ValueError as exc:
                     st.error(str(exc))
+            case_reviews = storage.list_case_analyst_reviews(incident.incident_id)
+            if case_reviews:
+                st.subheader("Case review history")
+                st.dataframe([{"reviewed_at": item.reviewed_at, "decision": item.decision,
+                    "analyst": item.analyst or "Not provided", "subject": f"{item.subject_type}:{item.subject_id}",
+                    "notes": item.notes, "evidence_refs": item.evidence_refs}
+                    for item in case_reviews], use_container_width=True, hide_index=True)
+            case_ai = storage.list_ai_activity(incident.incident_id)
+            if case_ai:
+                st.subheader("AI activity audit (separate from analyst decisions)")
+                st.dataframe([{"request_time": item.request_time, "provider": item.provider,
+                    "model": item.model, "status": item.status, "safe_summary": item.safe_summary,
+                    "evidence_refs": item.evidence_refs, "transmitted_fields": item.transmitted_fields}
+                    for item in case_ai], use_container_width=True, hide_index=True)
             st.dataframe(incident_timeline(storage, incident), use_container_width=True)
 
 
@@ -414,11 +644,29 @@ def _render_reports(st, storage: Storage):
         alert_list = [alert for alert in storage.list_alerts(limit=1000) if alert.alert_id in incident.alert_ids]
         event_list = [event for event in storage.list_events(5000) if event.event_id in incident.event_refs]
         notes = storage.list_notes(incident.incident_id)
-        markdown, payload = build_case_report(incident, alert_list, event_list, notes, redact_users, redact_ips)
+        reviews = storage.list_case_analyst_reviews(incident.incident_id)
+        ai_activity = storage.list_ai_activity(incident.incident_id)
+        try:
+            markdown, payload = build_case_report(incident, alert_list, event_list, notes,
+                redact_users, redact_ips, analyst_reviews=reviews, ai_activity=ai_activity)
+            with tempfile.TemporaryDirectory() as folder:
+                pdf_path = generate_pdf_case_report(incident, alert_list, event_list,
+                    Path(folder) / f"incident-{incident.incident_id[:8]}.pdf", notes,
+                    redact_users, redact_ips, analyst_reviews=reviews, ai_activity=ai_activity)
+                pdf_bytes = pdf_path.read_bytes()
+            state_key = f"_soc_case_report_{incident.incident_id}_{int(redact_users)}_{int(redact_ips)}"
+            st.session_state[state_key] = (markdown, payload, pdf_bytes)
+        except (OSError, RuntimeError, ValueError) as exc:
+            st.error(f"Could not generate the case report: {exc}")
+    state_key = f"_soc_case_report_{incident.incident_id}_{int(redact_users)}_{int(redact_ips)}"
+    if state_key in st.session_state:
+        markdown, payload, pdf_bytes = st.session_state[state_key]
         st.code(markdown, language="markdown")
         st.download_button("Download Markdown", markdown, file_name=f"incident-{incident.incident_id[:8]}.md")
         st.download_button("Download JSON", json.dumps(payload, indent=2, ensure_ascii=False),
                            file_name=f"incident-{incident.incident_id[:8]}.json", mime="application/json")
+        st.download_button("Download PDF", pdf_bytes, file_name=f"incident-{incident.incident_id[:8]}.pdf",
+                           mime="application/pdf")
 
 
 def main() -> None:
@@ -493,9 +741,10 @@ def main() -> None:
                      "maximum_log_bytes": DEFAULT_CONFIG.max_log_bytes,
                      "alert_deduplication_seconds": DEFAULT_CONFIG.alert_deduplication_seconds,
                      "correlation_window_seconds": DEFAULT_CONFIG.correlation_window_seconds,
+                     "threat_scoring": DEFAULT_CONFIG.threat_scoring.__dict__,
                      "optional_ai": "Disabled by default; local explanations remain available."})
-            st.info("These dashboard values apply for this session. Edit soc_toolkit/config.py and soc_toolkit/settings.py to change defaults.")
-            st.subheader("Optional AI explanation")
+            st.info("These dashboard values apply for this session. Edit soc_toolkit/config.py and soc_toolkit/settings.py to change defaults, including threat score factors and thresholds.")
+            st.subheader("AI Investigation Assistant")
             st.caption("Offline explanations are the default. External requests require both switches below, an HTTPS endpoint, and an API key in an environment variable.")
             enabled = st.checkbox("Enable optional external AI analysis", value=os.getenv("SOC_AI_ENABLED", "false").casefold() == "true")
             consent = st.checkbox("I consent to send the previewed sanitized alert summary", value=False)
@@ -504,21 +753,81 @@ def main() -> None:
             key_env = st.text_input("API key environment variable name", value="SOC_AI_API_KEY")
             ai_alerts = storage.list_alerts(limit=200)
             if ai_alerts:
-                selected = st.selectbox("Alert to explain", ai_alerts,
+                selected = st.selectbox("Alert to investigate", ai_alerts,
                     format_func=lambda item: f"{item.severity} {item.rule_id}: {item.message[:80]}")
+                linked_cases = [case for case in storage.list_incidents() if selected.alert_id in case.alert_ids]
+                related_case = st.selectbox("Related case (optional)", [None, *linked_cases],
+                    format_func=lambda item: "No related case" if item is None else f"{item.title} · {item.status}")
                 evidence_text = st.text_area("Optional selected evidence snippets (one per line)")
                 snippets = tuple(line for line in evidence_text.splitlines() if line.strip())[:5]
                 safe_alert, safe_evidence = sanitize_ai_payload(selected, snippets)
                 st.json({"alert_summary": safe_alert, "selected_evidence": list(safe_evidence)})
-                if st.button("Explain selected alert"):
+                if st.button("Build investigation summary"):
+                    ai_request_time = datetime.now(timezone.utc).isoformat(timespec="seconds")
                     provider = None
                     if enabled and endpoint.strip() and model.strip():
                         provider = OpenAICompatibleProvider(endpoint.strip(), key_env.strip(), model.strip(), consent)
-                    result = explain_alert(selected, provider, enabled=enabled,
-                                           explicit_consent=consent, selected_evidence=snippets)
-                    st.code(result.text)
-                    if result.is_hypothesis:
-                        st.caption("AI commentary is an unverified hypothesis, separate from observed evidence.")
+                    candidate_events = storage.list_events(5000)
+                    if related_case:
+                        case_event_ids = set(related_case.event_refs)
+                        candidate_events = [event for event in candidate_events if event.event_id in case_event_ids]
+                    groups = correlate_events(candidate_events, DEFAULT_CONFIG.correlation_window_seconds)
+                    summary = build_investigation_summary(selected, events=candidate_events,
+                        incident=related_case, correlation_groups=groups, provider=provider,
+                        enabled=enabled, explicit_consent=consent, selected_evidence=snippets)
+                    st.markdown("**Automated assessments**")
+                    st.write(list(summary.automated_assessments) or ["No automated assessment was supplied."])
+                    st.markdown("**Observed facts**")
+                    if summary.observed_facts:
+                        st.write(list(summary.observed_facts))
+                    else:
+                        st.info("No resolved, explicitly linked event facts were supplied.")
+                    st.markdown("**Supporting evidence**")
+                    if summary.supporting_evidence:
+                        st.dataframe([{"event_id": item.event_id, "source": item.source,
+                            "timestamp": item.timestamp, "event_type": item.event_type,
+                            "message": item.message, "evidence_refs": item.evidence_refs}
+                            for item in summary.supporting_evidence], use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No linked event records were available.")
+                    st.markdown("**Uncertainties**")
+                    st.write(list(summary.uncertainties))
+                    st.markdown("**Recommended next steps**")
+                    st.write(list(summary.recommended_next_steps) or ["No rule-specific next steps were supplied."])
+                    st.markdown("**Potential MITRE ATT&CK mapping**")
+                    if summary.potential_technique_matches:
+                        st.dataframe([{"status": item.mapping_status, "technique_id": item.technique_id,
+                            "technique": item.technique_name, "tactic": item.tactic,
+                            "qualification": item.qualification, "explanation": item.explanation,
+                            "evidence_refs": item.evidence_refs} for item in summary.potential_technique_matches],
+                            use_container_width=True, hide_index=True)
+                    else:
+                        st.info(f"Unmapped: {summary.technique_assessment.explanation}")
+                    if summary.ai_suggestion:
+                        st.markdown("**Unverified AI hypothesis**")
+                        st.write(summary.ai_suggestion)
+                    else:
+                        st.caption("No external AI suggestion was requested; the structured summary above is local and rule/evidence-derived.")
+                    external_invoked = summary.ai_status in {"suggestion", "failed"}
+                    case_refs = (related_case.incident_id,) if related_case else ()
+                    safe_audit_summary = sanitize_ai_text(summary.ai_suggestion or
+                        "Offline structured investigation summary prepared; no provider response was recorded.")
+                    record_ai_activity(storage,
+                        "OpenAI-compatible" if external_invoked else "local/rule-investigation-summary",
+                        provider.model if external_invoked and provider else "offline-structured-summary",
+                        summary.ai_status, safe_audit_summary,
+                        case_refs=case_refs,
+                        evidence_refs=tuple(sorted({ref for item in summary.supporting_evidence for ref in item.evidence_refs})),
+                        transmitted_fields=summary.transmitted_fields, request_time=ai_request_time)
+            ai_audit = storage.list_ai_activity()
+            if ai_audit:
+                st.subheader("AI activity audit trail")
+                st.caption("Audit summaries are separate from analyst decisions; raw prompts and selected evidence are not retained.")
+                st.dataframe([{"request_time": item.request_time, "provider": item.provider,
+                    "model": item.model, "status": item.status, "safe_summary": item.safe_summary,
+                    "case_refs": item.case_refs, "evidence_refs": item.evidence_refs,
+                    "transmitted_fields": item.transmitted_fields} for item in ai_audit],
+                    use_container_width=True, hide_index=True)
     except Exception as exc:
         logger.exception("Dashboard section failed")
         st.error(f"This section could not complete: {exc}")

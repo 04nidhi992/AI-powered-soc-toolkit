@@ -32,7 +32,9 @@ class AIProviderContractTests(unittest.TestCase):
                 patch("soc_toolkit.ai_analysis.urlopen") as urlopen:
             result = explain_alert(self.alert, provider, enabled=True, explicit_consent=True)
         urlopen.assert_not_called()
-        self.assertIn("External AI endpoints must use HTTPS", result.text)
+        self.assertEqual("failed", result.provider_status)
+        self.assertIn("Optional AI analysis failed", result.text)
+        self.assertNotIn("provider.example", result.text)
 
     def test_timeout_and_rate_limit_use_offline_fallback(self):
         failures = (
@@ -45,6 +47,7 @@ class AIProviderContractTests(unittest.TestCase):
                     patch("soc_toolkit.ai_analysis.urlopen", side_effect=failure):
                 result = explain_alert(self.alert, self.provider, enabled=True, explicit_consent=True)
             self.assertTrue(result.is_hypothesis)
+            self.assertEqual("failed", result.provider_status)
             self.assertTrue(result.text.startswith("Rule AUTH_FAILURE matched:"))
             self.assertIn("Optional AI analysis failed", result.text)
 
@@ -71,6 +74,7 @@ class AIProviderContractTests(unittest.TestCase):
         self.assertNotIn("192.0.2.7", sent)
         self.assertEqual("test-only", request.get_header("Authorization").removeprefix("Bearer "))
         self.assertIn("Unverified AI hypothesis:", result.text)
+        self.assertEqual("suggestion", result.provider_status)
 
 
 if __name__ == "__main__":

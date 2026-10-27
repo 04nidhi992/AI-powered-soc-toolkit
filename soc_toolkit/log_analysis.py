@@ -200,6 +200,7 @@ def _flatten_windows_json(data: dict) -> dict:
 def _xml_event(element: ET.Element, source: str, number: int) -> NormalizedEvent:
     local = lambda tag: tag.rsplit("}", 1)[-1]
     fields: dict[str, object] = {}
+    rendered_message = ""
     for node in element.iter():
         name = local(node.tag)
         if name == "EventID" and node.text:
@@ -221,7 +222,9 @@ def _xml_event(element: ET.Element, source: str, number: int) -> NormalizedEvent
                 fields["username"] = node.text
             elif data_name.casefold() in {"workstationname", "computername"}:
                 fields["host"] = node.text
-    message = " | ".join(f"{key}={value}" for key, value in fields.items())
+        elif name == "Message" and node.text and node.text.strip():
+            rendered_message = node.text.strip()
+    message = rendered_message or " | ".join(f"{key}={value}" for key, value in fields.items())
     return _event_from_mapping(fields, source, f"event-{number}", message)
 
 

@@ -14,7 +14,7 @@ flowchart LR
   C --> A[Alert lifecycle]
   A --> S[(SQLite storage)]
   S --> I[Incident investigation]
-  I --> R[Markdown and JSON reports]
+  I --> R[Markdown JSON and PDF reports]
   S --> U[Streamlit dashboard]
   I --> U
 ```
@@ -24,6 +24,7 @@ flowchart LR
 - Python 3.12+ (compatible with the installed Python 3.13), dataclasses and type hints for models.
 - `psutil` for local metrics and process metadata.
 - SQLite for local events, detections, alerts, incidents, notes, and status history.
+- ReportLab for paginated Unicode-aware PDF reports; pypdf validates generated report content in tests.
 - Streamlit and Plotly for the dashboard; pandas is optional and not required by the current implementation.
 - pytest for the test suite; Python logging for local application diagnostics.
 
@@ -39,7 +40,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-The requirements include `python-evtx` for native `.evtx` parsing. To update an existing virtual environment after upgrading the project, run `python -m pip install -r requirements.txt` (or `\.venv\Scripts\python.exe -m pip install -r requirements.txt` without activation). EVTX files are parsed locally; no external service is contacted. The repository does not bundle a real EVTX fixture, so native record parsing must be validated with an authorized sample on the target environment.
+The requirements include `python-evtx` for native `.evtx` parsing, ReportLab for PDF generation, and pypdf for PDF report validation in the test suite. To update an existing virtual environment after upgrading the project, run `python -m pip install -r requirements.txt` (or `\.venv\Scripts\python.exe -m pip install -r requirements.txt` without activation). EVTX files are parsed locally; no external service is contacted. The repository does not bundle a real EVTX fixture, so native record parsing must be validated with an authorized sample on the target environment.
 
 If PowerShell does not allow activation, do not change its execution policy. Use the environment's interpreter directly:
 
@@ -105,7 +106,7 @@ Streamlit prints a local URL. Open it in a browser. To stop the server, return t
 6. Open **Alerts**. Inspect the severity, reason, evidence references, and recommended steps. Change one alert to **investigating** and save; it should remain filtered under that status.
 7. Open **Correlation**. The synthetic events share host, username, or source-IP evidence, so related events should appear together. Time proximity alone is not enough to form a group.
 8. Open **Incidents**, create a case, link relevant alerts and events, enter observed facts and recommendations, and add a typed investigation note. Change the case status if appropriate.
-9. Open **Reports**, select the case, enable username and IP redaction, build the report, and inspect/download both Markdown and JSON. Secret-like assignments are redacted regardless of those optional toggles. Reports are triage documents and do not establish forensic admissibility.
+9. Open **Reports**, select the case, enable username and IP redaction, build the report, and inspect/download Markdown, JSON, and PDF. Secret-like assignments are redacted regardless of those optional toggles. Reports are triage documents and do not establish forensic admissibility.
 10. Open **Settings** to inspect session-level thresholds and optional AI configuration. Keep external AI disabled for this demonstration; offline explanations do not send data.
 
 The automated suite covers the service workflow and a Streamlit overview smoke test. The manual dashboard interactions above have not been browser-tested by the project automation. If a screen differs, note the section, action, and displayed error before changing the database or settings.
@@ -125,9 +126,23 @@ All detections are explainable rule matches and investigation leads. The applica
 
 The service-level suite also checks event deduplication, malformed/oversized inputs, correlation identity and time boundaries, incident notes, and redacted report content. Alert deduplication suppresses matching source/rule/message alerts inside its configured interval.
 
+### ATT&CK mapping and threat score
+
+Only `REPEATED_FAILED_LOGINS` currently maps to a potential ATT&CK technique: **T1110 Brute Force**, **Credential Access**. The rule demonstrates thresholded repeated authentication failures, which is consistent with T1110, but does not establish malicious intent or distinguish password guessing, spraying, or credential stuffing. No sub-technique is assigned. A potential match requires at least two distinct event references that resolve to supplied events and includes a behavioral qualification. Generic authentication failures, a failed-then-success sequence, path indicators, warning keywords, repeated generic event types, and system metrics are explicitly assessed as unmapped because their current evidence is insufficient to support a technique. See the official [MITRE ATT&CK T1110 entry](https://attack.mitre.org/techniques/T1110/).
+
+The triage score sums capped, documented components, then clamps to 0–100: distinct rule severity (INFO 0, LOW 5, MEDIUM 10, HIGH 20, CRITICAL 25 points per distinct rule; cap 60); unique supporting events (0 for the first, +2 per additional unique event ID; cap 20); independent source files (+5 when at least two sources support matched events); correlated evidence (+5 when an identity-linked group overlaps at least two matched events); and external enrichment (+15 per unique indicator with malicious provider detections, or +5 with suspicious detections; cap 15). Duplicate detection records, event references, repeated event objects with the same event ID, and repeated enrichment results for the same indicator are counted once. Detections whose references do not resolve to supplied events are excluded. Default display bands are LOW below 25, MEDIUM 25–49, HIGH 50–74, and CRITICAL 75–100. `ThreatScoringConfig` in `soc_toolkit/settings.py` and its `AppConfig` value expose these factors and thresholds for configuration.
+
+This score is an analyst prioritization aid, not a probability, attribution, or compromise verdict. Offline, missing, unavailable, and no-match intelligence contribute zero points and do not indicate benign activity. A score of zero does not establish safety. External enrichment contributes only when a provider result is explicitly linked to the matched evidence.
+
 ## Report scope
 
-Current case reports include linked events, alerts with rule identifiers and reasons, investigation notes, recommendations, uncertainty, and limitations. They do not yet include correlation groups or optional AI commentary as separate report sections. External AI remains optional and unverified against a real provider.
+Case reports include linked events and alerts, derived detections and correlations, extracted IOCs, potential ATT&CK mappings, investigation notes, analyst review decisions, safe AI activity summaries, recommendations, uncertainty, and limitations. PDF reports are generated with ReportLab from the same redacted case payload used by Markdown and JSON. External AI remains optional and unverified against a real provider.
+
+## Analyst review and AI audit trail
+
+Use **Alerts** to record one of four append-only decisions for a finding: `confirmed`, `false_positive`, `needs_review`, or `dismissed`. A reviewer name is stored only when entered. Decision transitions are checked; prior review rows and relevant status history remain available. Review notes and metadata pass through the storage sanitizers before persistence.
+
+AI request activity is stored separately from analyst decisions. Audit rows contain provider/model labels, request time, linked case/evidence references, status, safe summary, and transmitted field names only. Prompts, selected evidence text, and API keys are not written to this table. Report redaction applies to reviewer identities, notes, and AI summaries. The SQLite schema migrates additively from version 1 to version 2 when the app opens the database.
 
 ## Modules and data flow
 
@@ -136,11 +151,13 @@ Current case reports include linked events, alerts with rule identifiers and rea
 - `log_analysis.py`: streaming syslog, JSONL, CSV, Windows Event XML, and native EVTX ingestion; malformed-record reporting and normalization. Native EVTX parsing uses `python-evtx`.
 - `ioc_extraction.py`: validated IPv4/IPv6, domain, URL, MD5, SHA-1, and SHA-256 extraction from normalized events or text, with source evidence references. Indicators are labelled extracted, not malicious; private and reserved IP ranges are identified by scope.
 - `detection.py`, `correlation.py`: threshold, login-sequence, repeated-event, configured-rule, process, and evidence-led correlation logic.
+- `attack_mapping.py`, `threat_scoring.py`: conservative potential ATT&CK matches and a configurable, evidence-linked 0–100 triage score.
+- `storage.py`, `investigation.py`: append-only analyst decision history and separate AI activity audit records.
 - `alerts.py`, `storage.py`: alert persistence, filters, status lifecycle, duplicate suppression, SQLite schema versioning and transactions.
 - `investigation.py`: incidents, typed notes, status, and timelines.
-- `reports.py`: Markdown/JSON incident reports with configurable username/IP redaction.
+- `reports.py`: redacted Markdown/JSON case payloads and paginated PDF report generation.
 - `dashboard.py`, `main.py`: Streamlit UI and launch entry point.
-- `ai_analysis.py`: offline explanations by default; optional provider interface requires configuration and explicit consent.
+- `ai_analysis.py`: offline, event-linked structured alert/case summaries; optional provider suggestions require configuration and explicit consent and remain separate from observed facts, ATT&CK assessment, and recommendations.
 
 ## Rules and settings
 
@@ -148,7 +165,7 @@ Edit `soc_toolkit/settings.py` and `soc_toolkit/config.py` to change warning/cri
 
 ## Optional AI
 
-No AI request is made by default. Offline rule explanations always work. An optional OpenAI-compatible provider can be injected through `ai_analysis.py`; it requires an HTTPS endpoint, an API key supplied through an environment variable, an enabled setting, and explicit consent. Only a selected alert summary and selected evidence snippets are passed through basic IP, email, username, and secret-pattern redaction. Review the sanitized payload and provider terms before enabling it. Never configure credentials in source code. The app reads environment variables from its process; `.env.example` documents the variable names but is not automatically loaded.
+No AI request is made by default. The Settings assistant builds a local structured summary from alert-linked events and any explicitly linked case: observed facts, supporting evidence references, uncertainty, existing next steps, and evidence-qualified potential ATT&CK matches. Unsupported rules are shown as unmapped. Optional AI provider text appears separately as an unverified hypothesis. An optional OpenAI-compatible provider can be injected through `ai_analysis.py`; it requires an HTTPS endpoint, an API key supplied through an environment variable, an enabled setting, and explicit consent. Only the selected alert summary and explicitly selected evidence snippets are sent after sanitization; case event bodies are not sent automatically. Review the preview and provider terms before enabling it. Never configure credentials in source code. The app reads environment variables from its process; `.env.example` documents the variable names but is not automatically loaded.
 
 ## Threat intelligence enrichment
 
@@ -168,13 +185,36 @@ Without activation, run `.\.venv\Scripts\python.exe -m pytest -q`.
 
 The suite uses mocked system data and synthetic logs. It must not require administrator access, external scans, live attacks, private logs, or external AI access.
 
+### Verifying native EVTX parsing
+
+Install the declared parser into this project's virtual environment (no global install):
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+For an optional real-file integration test, download the 68 KB, seven-record `Security_short_selected.evtx` sample from the `omerbenamram/evtx` parser project's test corpus. The sample's upstream documentation identifies it as benign test data and the parser project is dual licensed MIT/Apache-2.0. Query-farm's [sample fixture notes](https://github.com/Query-farm/vgi-evtx/blob/main/test/sql/data/README.md) document the file provenance, event IDs, and licensing context. Download it to `sample_data`:
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://raw.githubusercontent.com/omerbenamram/evtx/master/samples/Security_short_selected.evtx" `
+  -OutFile "sample_data\Security_short_selected.evtx"
+$env:SOC_TEST_EVTX_PATH = (Resolve-Path "sample_data\Security_short_selected.evtx").Path
+.\.venv\Scripts\python.exe -m pytest -q tests/test_ioc_evtx.py -k real_evtx_fixture
+```
+
+The integration test checks successful native parsing and normalized event IDs, timestamps, computer names, providers, messages, and evidence references. User/account values are checked when present in the selected records. Mocked tests separately exercise malformed input, size limits, and missing-parser behavior. The downloaded sample is not committed by these instructions; verify its license and provenance before redistributing it. For the current 68 KB sample, event IDs are `5152, 4611, 4776, 4625, 5152, 5157, 4673`.
+
+To upload an EVTX file in the dashboard, start the app as described above, open **Log analysis**, choose **EVTX** (or leave **auto** selected for a `.evtx` filename), select the file, then click **Parse and analyze**. Parsing is local and the upload is subject to the configured maximum log size. The importer does not execute file contents.
+
 ## Limitations and ethical use
 
-- Native `.evtx` file ingestion is supported through `python-evtx`; the application does not read the live Windows Event Log service. No redistributable native EVTX fixture is included, and the parser's successful operation against a real EVTX file has not been verified by the repository test suite yet.
+- Native `.evtx` file ingestion uses `python-evtx`; the application does not read the live Windows Event Log service. The repository does not bundle a binary EVTX fixture. Set `SOC_TEST_EVTX_PATH` to a legally obtained sample to run the optional native-parser integration test; without it, that test is skipped and the default suite's EVTX parser-interface tests remain mocked.
 - IOC extraction validates and labels candidate values but does not assess reputation or maliciousness. Common example domains are excluded, and private/reserved IPs are marked by scope rather than treated as malicious.
 - It is a learning and triage tool, not a replacement for an EDR/SIEM, and its rules can produce false positives or miss events.
 - Path indicators do not prove malware. No process is terminated, quarantined, or modified.
 - Reports do not establish chain of custody, forensic integrity, or legal admissibility.
+- PDF generation requires ReportLab; pypdf is used by tests to validate generated report text and metadata.
 - Use only on systems and logs you are authorized to inspect. Imported records are stored locally in SQLite; avoid real sensitive logs unless you understand and accept that local retention.
 
 ## Troubleshooting

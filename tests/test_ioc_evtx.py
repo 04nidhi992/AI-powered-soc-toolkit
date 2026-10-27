@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import types
@@ -85,7 +86,8 @@ class EVTXIngestionTests(unittest.TestCase):
                '<Level>0</Level><TimeCreated SystemTime="2026-05-01T00:00:00.000Z"/>'
                '<Computer>WORKSTATION-1</Computer></System><EventData>'
                '<Data Name="TargetUserName">demo</Data><Data Name="IpAddress">192.0.2.7</Data>'
-               '<Data Name="LogonType">3</Data></EventData></Event>')
+               '<Data Name="LogonType">3</Data></EventData><RenderingInfo>'
+               '<Message>An account failed to log on.</Message></RenderingInfo></Event>')
 
         class Record:
             def xml(self):
@@ -102,6 +104,7 @@ class EVTXIngestionTests(unittest.TestCase):
         self.assertEqual(("4625", "Microsoft-Windows-Security-Auditing", "WORKSTATION-1", "demo", "192.0.2.7"),
                          (event.event_type, event.raw_fields["provider"], event.host, event.username, event.source_ip))
         self.assertEqual("3", event.raw_fields["data_logontype"])
+        self.assertEqual("An account failed to log on.", event.message)
 
     def test_malformed_evtx_is_reported_and_size_limit_applies(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -122,6 +125,36 @@ class EVTXIngestionTests(unittest.TestCase):
                 result = ingest_log_file(path)
         self.assertFalse(result.events)
         self.assertIn("python-evtx", result.errors[0].message)
+
+    @unittest.skipUnless(os.environ.get("SOC_TEST_EVTX_PATH"),
+                         "set SOC_TEST_EVTX_PATH to a genuine EVTX fixture for native parser verification")
+    def test_real_evtx_fixture_with_python_evtx(self):
+        fixture_path = Path(os.environ["SOC_TEST_EVTX_PATH"])
+        result = ingest_log_file(fixture_path)
+        self.assertEqual((), result.errors)
+        self.assertGreater(len(result.events), 0)
+        for event in result.events:
+            self.assertTrue(event.event_id)
+            self.assertTrue(event.timestamp)
+            self.assertTrue(event.host)
+            self.assertTrue(event.raw_fields.get("provider"))
+            self.assertTrue(event.message)
+            self.assertTrue(event.evidence_ref)
+            if event.username:
+                self.assertTrue(event.username.strip())
+        if fixture_path.name.casefold() == "security_short_selected.evtx":
+            self.assertEqual(["5152", "4611", "4776", "4625", "5152", "5157", "4673"],
+                             [event.event_type for event in result.events])
+            self.assertTrue(any(event.username for event in result.events))
+        oversized = ingest_log_file(fixture_path, max_bytes=1)
+        self.assertFalse(oversized.events)
+        self.assertIn("limit", oversized.errors[0].message.casefold())
+        with tempfile.TemporaryDirectory() as folder:
+            malformed_path = Path(folder) / "malformed.evtx"
+            malformed_path.write_bytes(b"not a Windows event log")
+            malformed = ingest_log_file(malformed_path)
+        self.assertFalse(malformed.events)
+        self.assertTrue(malformed.errors)
 
 
 if __name__ == "__main__":

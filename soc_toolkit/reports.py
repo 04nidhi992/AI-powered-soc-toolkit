@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 import html
+from io import BytesIO
 import json
 from pathlib import Path
 import re
@@ -11,6 +12,10 @@ from .alerts import read_recent_alerts
 from .log_analysis import LogFinding
 from .models import SecurityAlert
 from .models import Incident, InvestigationNote, NormalizedEvent
+from .attack_mapping import assess_detection_mapping
+from .correlation import correlate_events
+from .detection import detect_events
+from .ioc_extraction import extract_iocs_from_events
 
 
 _SECRET_ASSIGNMENT = re.compile(
@@ -124,11 +129,20 @@ def generate_json_incident_report(findings: Iterable[LogFinding], alerts: Iterab
 
 def build_case_report(incident: Incident, alerts: Iterable[SecurityAlert], events: Iterable[NormalizedEvent],
                       notes: Iterable[InvestigationNote] = (), redact_usernames: bool = True,
-                      redact_ips: bool = False) -> tuple[str, dict]:
+                      redact_ips: bool = False, *, analyst_reviews: Iterable[object] = (),
+                      ai_activity: Iterable[object] = ()) -> tuple[str, dict]:
     """Build report content with explicit redaction and uncertainty sections."""
     alert_list, event_list, note_list = list(alerts), list(events), list(notes)
     alert_list = [item for item in alert_list if item.alert_id in incident.alert_ids]
     event_list = [item for item in event_list if item.event_id in incident.event_refs]
+    note_list = [item for item in note_list if item.incident_id == incident.incident_id]
+    review_list = list(analyst_reviews)
+    ai_list = list(ai_activity)
+    detections = detect_events(event_list)
+    correlations = correlate_events(event_list)
+    indicators = extract_iocs_from_events(event_list)
+    technique_matches = [mapping for detection in detections
+                         for mapping in assess_detection_mapping(detection, available_events=event_list).matches]
     known_usernames = {event.username for event in event_list if event.username}
     def redact(value: str | None) -> str:
         if not value:
@@ -151,7 +165,8 @@ def build_case_report(incident: Incident, alerts: Iterable[SecurityAlert], event
         "metadata": {"title": redact(incident.title), "generated_at": created, "incident_id": incident.incident_id,
                      "redaction": {"usernames": redact_usernames, "ips": redact_ips}},
         "executive_summary": redact(incident.findings) or f"Incident {redact(incident.title)} is {incident.status}.",
-        "scope": {"status": incident.status, "linked_alerts": len(alert_list), "linked_events": len(event_list)},
+        "scope": {"status": incident.status, "linked_alerts": len(alert_list), "linked_events": len(event_list),
+                  "analyst_reviews": len(review_list)},
         "timeline": sorted(
             ([{"timestamp": event.timestamp, "kind": event.event_type, "evidence_ref": redact(event.evidence_ref),
                "message": redact(event.message)} for event in event_list] +
@@ -160,6 +175,40 @@ def build_case_report(incident: Incident, alerts: Iterable[SecurityAlert], event
                "message": redact(alert.message)} for alert in alert_list]),
             key=lambda item: item["timestamp"]),
         "alerts": [clean_alert(alert) for alert in alert_list],
+        "observed_events": [{"timestamp": event.timestamp, "event_type": event.event_type,
+            "evidence_ref": redact(event.evidence_ref), "message": redact(event.message)}
+            for event in sorted(event_list, key=lambda item: item.timestamp)],
+        "indicators": [{"type": indicator.indicator_type, "value": redact(indicator.value),
+            "classification": "extracted", "evidence_refs": [redact(ref) for ref in indicator.evidence_refs]}
+            for indicator in indicators],
+        "automated_assessments": {
+            "detections": [{"rule_id": item.rule_id, "rule_name": item.rule_name,
+                "severity": item.severity, "reason": redact(item.reason),
+                "evidence_refs": [redact(ref) for ref in item.event_refs]}
+                for item in detections],
+            "correlations": [{"start_time": item.start_time, "end_time": item.end_time,
+                "event_count": item.event_count, "shared_fields": item.shared_fields,
+                "explanation": redact(item.explanation), "evidence_refs": [redact(ref) for ref in item.event_refs]}
+                for item in correlations],
+        },
+        "attack_mappings": [{"status": item.mapping_status, "technique_id": item.technique_id,
+            "technique_name": item.technique_name, "tactic": item.tactic,
+            "rule_id": item.rule_id, "explanation": redact(item.explanation),
+            "qualification": redact(item.qualification),
+            "evidence_refs": [redact(ref) for ref in item.evidence_refs], "source_url": item.source_url}
+            for item in technique_matches],
+        "analyst_reviews": [{"reviewed_at": item.reviewed_at, "subject_type": item.subject_type,
+            "subject_id": item.subject_id, "decision": item.decision,
+            "analyst": "[REDACTED]" if redact_usernames and item.analyst else redact(item.analyst or "Not provided"),
+            "notes": redact(item.notes), "case_refs": [redact(ref) for ref in item.case_refs],
+            "evidence_refs": [redact(ref) for ref in item.evidence_refs]}
+            for item in review_list],
+        "ai_activity": [{"provider": redact(item.provider), "model": redact(item.model),
+            "request_time": item.request_time, "status": item.status,
+            "safe_summary": redact(item.safe_summary), "case_refs": [redact(ref) for ref in item.case_refs],
+            "evidence_refs": [redact(ref) for ref in item.evidence_refs],
+            "transmitted_fields": item.transmitted_fields}
+            for item in ai_list],
         "findings": redact(incident.findings),
         "investigation_notes": [{"timestamp": note.created_at, "category": note.category,
                                  "author": "[REDACTED]" if redact_usernames else note.author,
@@ -196,7 +245,41 @@ def build_case_report(incident: Incident, alerts: Iterable[SecurityAlert], event
     else:
         markdown.append("No notes recorded.")
     markdown.extend(["", "## Recommendations", "", _markdown_text(redact(incident.recommendations) or "Validate the evidence and document next actions."),
-                     "", "## Limitations and uncertainty", "", payload["uncertainty"], "",
+                     "", "## Automated assessments", ""])
+    if detections:
+        markdown.extend(f"- `{item.rule_id}` ({item.severity}): {_markdown_text(redact(item.reason))}; evidence: "
+                        f"{_markdown_text(', '.join(redact(ref) for ref in item.event_refs))}" for item in detections)
+    else:
+        markdown.append("No automated detection matched the linked events.")
+    markdown.extend(["", "## Extracted indicators", ""])
+    if indicators:
+        markdown.extend(f"- {indicator.indicator_type}: `{_markdown_text(redact(indicator.value))}` (extracted, not a verdict); evidence: "
+                        f"{_markdown_text(', '.join(redact(ref) for ref in indicator.evidence_refs))}" for indicator in indicators)
+    else:
+        markdown.append("No supported indicators were extracted from linked events.")
+    markdown.extend(["", "## Potential ATT&CK matches", ""])
+    if technique_matches:
+        markdown.extend(f"- Potential `{item.technique_id}` {item.technique_name} ({item.tactic}), rule `{item.rule_id}`: "
+                        f"{_markdown_text(redact(item.explanation))} Qualification: {_markdown_text(redact(item.qualification))}; evidence: "
+                        f"{_markdown_text(', '.join(redact(ref) for ref in item.evidence_refs))}" for item in technique_matches)
+    else:
+        markdown.append("No supported ATT&CK technique mapping is available.")
+    markdown.extend(["", "## Analyst review decisions", ""])
+    if review_list:
+        markdown.extend(f"- `{item.reviewed_at}` {item.decision} by "
+                        f"{('[REDACTED]' if redact_usernames and item.analyst else redact(item.analyst or 'Not provided'))}: "
+                        f"{_markdown_text(redact(item.notes))}; evidence: "
+                        f"{_markdown_text(', '.join(redact(ref) for ref in item.evidence_refs))}" for item in review_list)
+    else:
+        markdown.append("No analyst review decisions recorded.")
+    markdown.extend(["", "## AI activity (separate from analyst decisions)", ""])
+    if ai_list:
+        markdown.extend(f"- `{item.request_time}` {redact(item.provider)} / {redact(item.model)} ({item.status}): "
+                        f"{_markdown_text(redact(item.safe_summary))}; evidence: "
+                        f"{_markdown_text(', '.join(redact(ref) for ref in item.evidence_refs))}" for item in ai_list)
+    else:
+        markdown.append("No AI activity was recorded.")
+    markdown.extend(["", "## Limitations and uncertainty", "", payload["uncertainty"],
                      "Rule matches and indicators are not proof of malicious activity. This report does not establish forensic integrity or legal admissibility.", ""])
     return "\n".join(markdown), payload
 
@@ -212,3 +295,150 @@ def write_case_report(incident: Incident, alerts: Iterable[SecurityAlert], event
     md_path.write_text(markdown, encoding="utf-8")
     js_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return md_path, js_path
+
+
+def generate_pdf_case_report(incident: Incident, alerts: Iterable[SecurityAlert], events: Iterable[NormalizedEvent],
+                             output_path: str | Path, notes: Iterable[InvestigationNote] = (),
+                             redact_usernames: bool = True, redact_ips: bool = False, *,
+                             analyst_reviews: Iterable[object] = (),
+                             ai_activity: Iterable[object] = ()) -> Path:
+    """Generate a paginated PDF report from the same sanitized case payload as Markdown/JSON."""
+    markdown, payload = build_case_report(incident, alerts, events, notes,
+        redact_usernames, redact_ips, analyst_reviews=analyst_reviews, ai_activity=ai_activity)
+    del markdown
+    try:
+        from reportlab import __file__ as reportlab_file
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import (HRFlowable, Paragraph, SimpleDocTemplate,
+            Spacer, Table, TableStyle)
+
+        font_dir = Path(reportlab_file).parent / "fonts"
+        if "SOCToolkitVera" not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont("SOCToolkitVera", str(font_dir / "Vera.ttf")))
+            pdfmetrics.registerFont(TTFont("SOCToolkitVera-Bold", str(font_dir / "VeraBd.ttf")))
+        fallback_fonts = []
+        for candidate in (Path("C:/Windows/Fonts/arial.ttf"), Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+                          Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf")):
+            if candidate.is_file():
+                fallback_name = "SOCToolkitUnicodeFallback"
+                if fallback_name not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont(fallback_name, str(candidate)))
+                fallback_fonts.append(fallback_name)
+                break
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle("SOC_Title", parent=styles["Title"], fontName="SOCToolkitVera-Bold",
+            fontSize=20, leading=25, textColor=colors.HexColor("#10243A"), alignment=TA_CENTER, spaceAfter=8)
+        heading_style = ParagraphStyle("SOC_Heading", parent=styles["Heading2"], fontName="SOCToolkitVera-Bold",
+            fontSize=12, leading=16, textColor=colors.HexColor("#14547A"), spaceBefore=12, spaceAfter=5, keepWithNext=True)
+        body_style = ParagraphStyle("SOC_Body", parent=styles["BodyText"], fontName="SOCToolkitVera",
+            fontSize=8.5, leading=12, wordWrap="CJK", spaceAfter=4)
+        small_style = ParagraphStyle("SOC_Small", parent=body_style, fontSize=7, leading=9,
+            textColor=colors.HexColor("#566575"))
+        empty_style = ParagraphStyle("SOC_Empty", parent=body_style, textColor=colors.HexColor("#566575"), italic=True)
+
+        def paragraph(value: object, style=body_style) -> Paragraph:
+            raw = str(value if value is not None else "")
+            primary = style.fontName
+            font_options = [primary, *fallback_fonts]
+            runs: list[tuple[str, str]] = []
+            for character in raw:
+                font_name = next((name for name in font_options
+                    if ord(character) in getattr(pdfmetrics.getFont(name).face, "charToGlyph", {})), primary)
+                if runs and runs[-1][0] == font_name:
+                    runs[-1] = (font_name, runs[-1][1] + character)
+                else:
+                    runs.append((font_name, character))
+            safe = "".join(f'<font name="{font_name}">{html.escape(text, quote=True)}</font>'
+                           for font_name, text in runs).replace("\n", "<br/>")
+            return Paragraph(safe or "&#160;", style)
+
+        story = [paragraph(payload["metadata"]["title"] or "Investigation Report", title_style),
+                 paragraph(f"Generated {payload['metadata']['generated_at']} · Case {payload['metadata']['incident_id']}", small_style),
+                 HRFlowable(width="100%", thickness=1.2, color=colors.HexColor("#1B6A8F")), Spacer(1, 10)]
+
+        def section(title: str, entries: Iterable[object], empty: str = "No records available.") -> None:
+            story.append(paragraph(title, heading_style))
+            rows = list(entries)
+            if not rows:
+                story.append(paragraph(empty, empty_style))
+            else:
+                story.extend(paragraph(row) for row in rows)
+
+        section("Case summary", [payload["executive_summary"] or "No summary documented."])
+        scope = payload["scope"]
+        story.append(paragraph("Scope", heading_style))
+        scope_table = Table([
+            [paragraph("Case status", small_style), paragraph(scope["status"])],
+            [paragraph("Linked alerts", small_style), paragraph(scope["linked_alerts"])],
+            [paragraph("Linked events", small_style), paragraph(scope["linked_events"])],
+            [paragraph("Analyst reviews", small_style), paragraph(scope["analyst_reviews"])],
+        ], colWidths=[1.6 * inch, 4.8 * inch], hAlign="LEFT")
+        scope_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EAF1F7")),
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#CAD5DF")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.extend([scope_table, Spacer(1, 6)])
+
+        section("Observed event timeline", [
+            f"{item['timestamp']} · {item['event_type']} · Evidence {item['evidence_ref']} · {item['message']}"
+            for item in payload["observed_events"]], "No events are linked to this case.")
+        section("Linked alerts", [
+            f"{item['severity']} · {item['rule_id'] or item['source']} · {item['message']} · {item['reason']} · Evidence {', '.join(item['evidence_refs'])}"
+            for item in payload["alerts"]], "No alerts are linked to this case.")
+        section("Observed facts / case findings (analyst-documented)",
+            [payload["findings"] or "No findings documented."])
+        section("Extracted IOCs (not threat verdicts)", [
+            f"{item['type']} · {item['value']} · {item['classification']} · Evidence {', '.join(item['evidence_refs'])}"
+            for item in payload["indicators"]], "No supported indicators extracted.")
+        automated = payload["automated_assessments"]
+        section("Automated detections", [
+            f"{item['rule_id']} ({item['severity']}) · {item['reason']} · Evidence {', '.join(item['evidence_refs'])}"
+            for item in automated["detections"]], "No detection matched linked events.")
+        section("Event correlation evidence", [
+            f"{item['start_time']}–{item['end_time']} · {item['event_count']} events · Shared fields {', '.join(item['shared_fields'])} · {item['explanation']} · Evidence {', '.join(item['evidence_refs'])}"
+            for item in automated["correlations"]], "No identity-linked correlation group found.")
+        section("Potential MITRE ATT&CK matches", [
+            f"Potential {item['technique_id']} {item['technique_name']} ({item['tactic']}) · Rule {item['rule_id']} · {item['explanation']} · Qualification: {item['qualification']} · Evidence {', '.join(item['evidence_refs'])} · {item['source_url']}"
+            for item in payload["attack_mappings"]], "No supported ATT&CK mapping available.")
+        section("Analyst review decisions", [
+            f"{item['reviewed_at']} · {item['decision']} · Analyst {item['analyst']} · {item['notes']} · Evidence {', '.join(item['evidence_refs'])}"
+            for item in payload["analyst_reviews"]], "No analyst review decisions recorded.")
+        section("AI activity and suggestions (separate from analyst decisions)", [
+            f"{item['request_time']} · {item['provider']} / {item['model']} · {item['status']} · {item['safe_summary']} · Evidence {', '.join(item['evidence_refs'])}"
+            for item in payload["ai_activity"]], "No AI activity recorded.")
+        section("Investigation notes", [
+            f"{item['timestamp']} · {item['category']} · {item['author']} · {item['content']}"
+            for item in payload["investigation_notes"]], "No investigation notes recorded.")
+        section("Recommendations", [payload["recommendations"] or "Validate evidence and document next actions."])
+        section("Limitations and uncertainty", [*payload["limitations"], payload["uncertainty"],
+            "Automated detections, IOCs, correlations, and technique matches support review; they do not establish malicious activity, attribution, forensic integrity, or legal admissibility."])
+
+        buffer = BytesIO()
+        generated = payload["metadata"]["generated_at"]
+        def page_footer(canvas, document):
+            canvas.saveState()
+            canvas.setFont("SOCToolkitVera", 7)
+            canvas.setFillColor(colors.HexColor("#566575"))
+            canvas.drawString(document.leftMargin, 0.45 * inch, f"Generated {generated} · {payload['metadata']['incident_id']}")
+            canvas.drawRightString(letter[0] - document.rightMargin, 0.45 * inch, f"Page {document.page}")
+            canvas.restoreState()
+
+        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=0.65 * inch, leftMargin=0.65 * inch,
+            topMargin=0.7 * inch, bottomMargin=0.7 * inch, title=payload["metadata"]["title"],
+            author="AI-Powered SOC & DFIR Investigation Copilot",
+            subject=f"Investigation case report · {payload['metadata']['title']}")
+        doc.build(story, onFirstPage=page_footer, onLaterPages=page_footer)
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(buffer.getvalue())
+        return destination
+    except Exception as exc:
+        raise RuntimeError("PDF report generation failed") from exc

@@ -35,6 +35,39 @@ class ProcessIndicators:
 
 
 @dataclass(frozen=True)
+class ThreatScoringConfig:
+    """Configurable triage score weights; points are not probabilities."""
+
+    info_rule_points: int = 0
+    low_rule_points: int = 5
+    medium_rule_points: int = 10
+    high_rule_points: int = 20
+    critical_rule_points: int = 25
+    max_rule_points: int = 60
+    points_per_additional_event: int = 2
+    max_event_points: int = 20
+    independent_source_points: int = 5
+    correlation_group_points: int = 5
+    malicious_intel_points: int = 15
+    suspicious_intel_points: int = 5
+    max_intel_points: int = 15
+    medium_threshold: int = 25
+    high_threshold: int = 50
+    critical_threshold: int = 75
+
+    def __post_init__(self) -> None:
+        values = (self.info_rule_points, self.low_rule_points, self.medium_rule_points,
+                  self.high_rule_points, self.critical_rule_points, self.max_rule_points,
+                  self.points_per_additional_event, self.max_event_points,
+                  self.independent_source_points, self.correlation_group_points,
+                  self.malicious_intel_points, self.suspicious_intel_points, self.max_intel_points)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in values):
+            raise ValueError("Threat scoring weights must be non-negative integers")
+        if not 1 <= self.medium_threshold <= 100 or not self.medium_threshold < self.high_threshold <= 100 or not self.high_threshold < self.critical_threshold <= 100:
+            raise ValueError("Threat score thresholds must be increasing values from 1 to 100")
+
+
+@dataclass(frozen=True)
 class DetectionRule:
     rule_id: str
     name: str
